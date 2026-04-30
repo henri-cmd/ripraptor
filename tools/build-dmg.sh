@@ -107,11 +107,12 @@ cp src/app.py "$APP/Contents/Resources/app.py"
 cp src/hls_fetcher.py "$APP/Contents/Resources/hls_fetcher.py"
 
 # Static resources (icon, splash, etc).
-cp resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-cp resources/banner.png    "$APP/Contents/Resources/banner.png"
-cp resources/get-ripped.png "$APP/Contents/Resources/get-ripped.png"
-cp resources/title.mp4     "$APP/Contents/Resources/title.mp4"
-cp resources/Info.plist    "$APP/Contents/Info.plist"
+cp resources/AppIcon.icns               "$APP/Contents/Resources/AppIcon.icns"
+cp resources/banner.png                 "$APP/Contents/Resources/banner.png"
+cp resources/get-ripped.png             "$APP/Contents/Resources/get-ripped.png"
+cp resources/title.mp4                  "$APP/Contents/Resources/title.mp4"
+cp resources/something-went-wrong.mp4   "$APP/Contents/Resources/something-went-wrong.mp4"
+cp resources/Info.plist                 "$APP/Contents/Info.plist"
 
 # Bundled binaries (yt-dlp, ffmpeg, ffprobe). These are what app.py's
 # _BUNDLED_BIN_DIR lookup expects. Preserve permissions; the symlink-free

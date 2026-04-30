@@ -665,7 +665,10 @@ def _make_editor_session(*, kind: str, page_url: str, cookies: list,
     sess["cached_path"] = ""
     sess["items"] = []
     sess["markers"] = []   # [{id, t, label}, …] — navigational bookmarks
-    sess["default_quality"] = "source"
+    # "best" = no scaling (ffmpeg passes through source resolution). Same
+    # spelling as the main-page card's quality dropdown so the editor's
+    # default matches whatever the user picked when starting the rip.
+    sess["default_quality"] = "best"
     return sess
 
 
@@ -2872,7 +2875,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path in ("/banner.png", "/get-ripped.png", "/title.mp4"):
+        if path in ("/banner.png", "/get-ripped.png", "/title.mp4",
+                    "/something-went-wrong.mp4"):
             here = os.path.dirname(os.path.abspath(__file__))
             fp = os.path.join(here, path.lstrip("/"))
             try:
@@ -3113,7 +3117,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "sid": sid,
                 "items": sess.get("items", []),
                 "markers": sess.get("markers", []),
-                "default_quality": sess.get("default_quality", "source"),
+                "default_quality": sess.get("default_quality", "best"),
                 "title": sess.get("title", ""),
                 "filename_hint": sess.get("filename_hint", ""),
                 "duration": sess.get("duration", 0.0),
@@ -3500,7 +3504,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "duration": sess.get("duration", 0.0),
                     "title": sess.get("title", ""),
                     "filename_hint": sess.get("filename_hint", ""),
-                    "default_quality": sess.get("default_quality", "source"),
+                    "default_quality": sess.get("default_quality", "best"),
                 })
 
             if path == "/editor/items":
@@ -4394,10 +4398,69 @@ INDEX_HTML = r"""<!doctype html>
   .settings-menu .settings-about strong { color: #000; }
   /* Author credit — italic, slightly muted, sits between app name and
      dependency versions. */
+  /* Animation toggles — checkbox + label rows that sit between the
+     button list and the about footer. Match the chrome of the buttons
+     so they read as part of the same menu. */
+  .settings-menu .settings-toggle {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 8px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+    color: #000;
+  }
+  .settings-menu .settings-toggle:hover { background: #d8d8d8; }
+  /* Global `input { width:100% }` rule (line ~3913) stretches every input
+     across its container. Override here so the checkbox stays its native
+     size and the label text gets the rest of the row. */
+  .settings-menu .settings-toggle input[type="checkbox"] {
+    margin: 0;
+    width: auto;
+    flex: 0 0 auto;
+    accent-color: #000080;
+  }
+  .settings-menu .settings-toggle span {
+    flex: 1 1 auto;
+    white-space: nowrap;
+  }
   .settings-menu .settings-credit {
     font-style: italic;
     color: #606060;
     margin: 1px 0 4px;
+  }
+
+  /* === Error popup ====================================================
+     Centered video overlay shown on card-level errors. Square 1440x1440
+     source video, sized down to fit the viewport with a soft feathered
+     edge so it integrates with the dim backdrop. Click anywhere or wait
+     for the video to end → dismissed. */
+  .rr-error-overlay {
+    position: fixed; inset: 0;
+    z-index: 100000;  /* above the rip overlay (99999) so it always wins */
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+    transition: opacity 280ms;
+  }
+  .rr-error-box {
+    width: min(60vw, 480px);
+    max-width: 90vw;
+    max-height: 80vh;
+    aspect-ratio: 1 / 1;
+    pointer-events: none;  /* clicks fall through to the overlay's listener */
+  }
+  .rr-error-vid {
+    width: 100%; height: 100%;
+    display: block;
+    background: transparent;
+    -webkit-mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    mask-composite: intersect;
   }
 
   /* === Rip Raptor "GET RIPPED!" overlay animation =====================
@@ -4447,6 +4510,22 @@ INDEX_HTML = r"""<!doctype html>
      grey background. The .window app shell is hidden until the title
      finishes (or is skipped) — see JS below. Auto-dismisses on `ended`,
      click, or after a 10s safety timeout. -->
+<!-- Edge-feather mask: stacks horizontal + vertical linear gradients
+     and intersects them with mask-composite, so each of the four edges
+     fades smoothly into the grey background instead of showing a sharp
+     rectangular cut. Tweak the 7% stops to soften/sharpen the falloff. -->
+<style>
+  #rr-title-vid {
+    -webkit-mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    mask-composite: intersect;
+  }
+</style>
 <div id="rr-title-seq" style="position:fixed; inset:0; z-index:99999; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.4s; background:#c0c0c0;">
   <video id="rr-title-vid"
          src="/title.mp4"
@@ -4576,6 +4655,23 @@ let dest = DEFAULT_DEST;
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
 $("#dest").value = dest;
+
+// ───── Animation toggles ────────────────────────────────────────────────
+// Three animations live in the app: the launch title sequence (intro),
+// the GET RIPPED! overlay (rip), and the something-went-wrong popup
+// (error). Each one independently respects a localStorage flag so the
+// user can mute any subset from the settings menu. Default is on for
+// all three; flag value is "off" or absent.
+function isAnimEnabled(name) {
+  try { return localStorage.getItem("rr.anim." + name) !== "off"; }
+  catch (e) { return true; }
+}
+function setAnimEnabled(name, on) {
+  try {
+    if (on) localStorage.removeItem("rr.anim." + name);
+    else    localStorage.setItem("rr.anim." + name, "off");
+  } catch (e) {}
+}
 
 $("#url").addEventListener("keydown", e => { if (e.key === "Enter") addUrl(); });
 
@@ -5032,6 +5128,9 @@ setTimeout(() => checkAppVersion(false), 2800);
     }
   }
   if (!overlay) { dismiss(); return; }
+  // User-muted via Settings → Animations. Skip the video entirely and
+  // dismiss instantly so the app renders without a black flash.
+  if (!isAnimEnabled("intro")) { dismiss(); return; }
   const vid = document.getElementById("rr-title-vid");
   if (vid) {
     vid.addEventListener("ended", dismiss);
@@ -5335,6 +5434,9 @@ function _ripBuildClawD(seed, length, width) {
 }
 
 function playRipAnimation(opts) {
+  // User-muted via Settings → Animations. Bail before allocating the
+  // overlay so we don't waste DOM churn on something that's hidden.
+  if (!isAnimEnabled("rip")) return;
   opts = opts || {};
   const count = Math.max(1, opts.count || 1);
   const stagger = opts.stagger != null ? opts.stagger : 180; // ms between bursts
@@ -5345,6 +5447,44 @@ function playRipAnimation(opts) {
   for (let i = 0; i < count; i++) {
     setTimeout(() => _spawnRipOverlay(done), i * stagger);
   }
+}
+
+// ───── Error animation ──────────────────────────────────────────────────
+// Plays /something-went-wrong.mp4 in a centered popup whenever the app
+// surfaces a card-level error (see card.setStatus's edge-trigger). Single
+// flight: if an overlay is already on screen we bail rather than stack
+// (a Rip All with 5 failures shouldn't spawn 5 overlays).
+function playErrorAnimation() {
+  if (!isAnimEnabled("error")) return;
+  if (document.getElementById("rr-error-overlay")) return;
+  const overlay = document.createElement("div");
+  overlay.id = "rr-error-overlay";
+  overlay.className = "rr-error-overlay";
+  overlay.innerHTML = `
+    <div class="rr-error-box">
+      <video class="rr-error-vid" src="/something-went-wrong.mp4"
+             autoplay playsinline preload="auto"></video>
+    </div>`;
+  let dismissed = false;
+  function dismiss() {
+    if (dismissed) return;
+    dismissed = true;
+    overlay.style.opacity = "0";
+    setTimeout(() => { try { overlay.remove(); } catch(e) {} }, 280);
+  }
+  overlay.addEventListener("click", dismiss);
+  const vid = overlay.querySelector("video");
+  if (vid) {
+    vid.addEventListener("ended", dismiss);
+    vid.addEventListener("error", dismiss);
+    // Safety: any video that runs longer than 8s (or fails to fire `ended`)
+    // gets dismissed anyway so we don't lock the foreground forever.
+    setTimeout(dismiss, 8000);
+    vid.play().catch(() => dismiss());
+  } else {
+    dismiss();
+  }
+  document.body.appendChild(overlay);
 }
 
 function _spawnRipOverlay(onDone) {
@@ -5758,12 +5898,15 @@ function makeCard(url) {
   };
   syncFormats();
 
-  // Editor uses ["source","1080","720","480","360"]. Main page may pick
-  // "best", "audio", "master", "v:<url>", or a numeric height — only
-  // numeric heights map cleanly; everything else becomes "source".
+  // Editor's QUALITY_OPTIONS now mirror the main page: "best" + every
+  // height in [2160, 1440, 1080, 720, 480, 360]. Pass "best" and numeric
+  // heights through verbatim; "audio"/"master"/"v:<url>" have no clean
+  // editor mapping (those modes don't even open the editor) so we fall
+  // back to "best" defensively.
   const qualityForEditor = () => {
     const v = String(q.value || "");
-    return /^\d+$/.test(v) ? v : "source";
+    if (v === "best" || /^\d+$/.test(v)) return v;
+    return "best";
   };
 
   const renderSummary = () => {
@@ -5841,11 +5984,20 @@ function makeCard(url) {
     edStrip.classList.add("show");
   };
 
+  // Edge-trigger: only fire the error animation when transitioning INTO
+  // the err state (not on every status update while already errored).
+  // Closure-scoped so each card tracks its own kind transitions.
+  let _prevStatusKind = "";
   const card = {
     el,
     setStatus(html, kind) {
       status.innerHTML = html || "";
       status.className = "status" + (kind ? " " + kind : "");
+      const k = kind || "";
+      if (k === "err" && _prevStatusKind !== "err") {
+        try { playErrorAnimation(); } catch (e) {}
+      }
+      _prevStatusKind = k;
     },
     getEditorItems() { return editorItems; },
     getCardSid() { return cardSid; },
@@ -5925,7 +6077,7 @@ function makeCard(url) {
               body: JSON.stringify({
                 sid: cardSid, start: it.start, end: it.end,
                 container: it.container || "mp4",
-                quality: it.quality || "source",
+                quality: it.quality || "best",
                 dest, name: it.name || "",
                 // Live override: server combines source name + clip name as
                 // "<source> - <clip>.ext". Pass the card's CURRENT title so
@@ -5963,7 +6115,7 @@ function makeCard(url) {
               body: JSON.stringify({
                 sid: cardSid, t: it.t,
                 format: it.format || "jpeg",
-                quality: it.quality || "source",
+                quality: it.quality || "best",
                 dest, name: it.name || "",
                 // See /clip note above.
                 filename_hint: title.value || "",
@@ -6619,7 +6771,7 @@ function makeCard(url) {
         url: itemData.webpage_url || itemData.referer || url,
         referer: itemData.referer || "",
         title: titleText, filename_hint: titleText,
-        default_quality: "source",
+        default_quality: qualityForEditor(),
         cookies_browser: getCookiesBrowser(),
         // For carousel-with-needs_ytdlp items, item.num is the 1-indexed
         // slide position. Pass it as --playlist-items so yt-dlp picks the
@@ -6630,7 +6782,7 @@ function makeCard(url) {
         src_url: itemData.url,
         page_url: itemData.referer || url,
         title: titleText, filename_hint: titleText,
-        default_quality: "source",
+        default_quality: qualityForEditor(),
         cookies_browser: getCookiesBrowser(),
       };
       try {
@@ -6906,6 +7058,38 @@ async function openSettingsMenu(ev) {
       b.addEventListener("click", fn);
       menu.appendChild(b);
     }
+  }
+
+  // ───── Animations toggles ────────────────────────────────────────────
+  // Three checkboxes for the three animations. Each persists to
+  // localStorage immediately on change — no Save button needed. The
+  // menu stays open so the user can flip several at once.
+  const animLabel = document.createElement("div");
+  animLabel.className = "settings-section-label";
+  animLabel.textContent = "Animations";
+  menu.appendChild(animLabel);
+  const ANIMS = [
+    ["intro", "Intro animation"],
+    ["rip",   "“Rip It!” animation"],
+    ["error", "Error animation"],
+  ];
+  for (const [key, label] of ANIMS) {
+    const row = document.createElement("label");
+    row.className = "settings-toggle";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = isAnimEnabled(key);
+    cb.addEventListener("change", () => {
+      setAnimEnabled(key, cb.checked);
+    });
+    // stopPropagation so clicking inside the menu doesn't trigger the
+    // outside-click dismiss installed by the setTimeout below.
+    row.addEventListener("click", (e) => e.stopPropagation());
+    const txt = document.createElement("span");
+    txt.textContent = label;
+    row.appendChild(cb);
+    row.appendChild(txt);
+    menu.appendChild(row);
   }
 
   // About footer — credit + versions of every external tool we depend
@@ -8050,7 +8234,7 @@ const items = []; // {kind: "clip"|"still", ...}
 let nextId = 1;
 let activeItemId = null;
 let preSnapshot = null; // pre-selection {inPoint, outPoint, currentTime}
-let defaultQuality = "source";
+let defaultQuality = "best";
 // Markers (labelled bookmarks). Declared up here next to `items` so that
 // any code path running before the marker section finishes evaluating
 // — _refreshPanBar, refreshTimeline, anything called during script
@@ -8060,9 +8244,14 @@ let defaultQuality = "source";
 let markers = [];
 let _markerNextId = 1;
 
-// Quality options for new clips/stills. "source" = no scaling.
+// Quality options for new clips/stills — kept in sync with the main-page
+// card's quality dropdown so the editor's default matches whatever the
+// user picked when starting the rip. "best" = no scaling (output at
+// source resolution); numeric heights downscale via ffmpeg.
 const QUALITY_OPTIONS = [
-  ["source", "Source"],
+  ["best", "Best available"],
+  ["2160", "2160p"],
+  ["1440", "1440p"],
   ["1080", "1080p"],
   ["720",  "720p"],
   ["480",  "480p"],
@@ -8071,6 +8260,14 @@ const QUALITY_OPTIONS = [
 function qualityLabel(v) {
   for (const [val, lbl] of QUALITY_OPTIONS) if (val === v) return lbl;
   return v;
+}
+// Legacy compat: pre-0.1 sessions saved items with quality:"source", which
+// is functionally identical to "best" (both map to None in the backend's
+// _quality_to_height). Normalize at every read site so old saved sessions
+// render the dropdown selection correctly without a migration step.
+function normalizeQuality(q) {
+  if (!q || q === "source") return "best";
+  return q;
 }
 
 function fmtTime(s) {
@@ -9958,8 +10155,9 @@ function renderItems() {
     // Single quotes around the URL — the outer style="…" uses double quotes,
     // and data: URIs contain none of these so this is unambiguous.
     const thumbStyle = it.thumb ? `background-image:url('${it.thumb}')` : "";
+    const itq = normalizeQuality(it.quality);
     const qOpts = QUALITY_OPTIONS.map(([v, l]) =>
-      `<option value="${v}" ${(it.quality||"source") === v ? "selected" : ""}>${l}</option>`
+      `<option value="${v}" ${itq === v ? "selected" : ""}>${l}</option>`
     ).join("");
     // Index of this row in items[] — used to disable up at top, down
     // at bottom. Cheap because items lists are short.
@@ -10228,7 +10426,7 @@ function persistItems() {
       container: (it.kind === "clip" || it.kind === "concat")
                  ? (it.container || "mp4-web") : null,
       format:    it.kind === "still" ? (it.format || "jpeg") : null,
-      quality:   it.quality || "source",
+      quality:   normalizeQuality(it.quality),
       crop:      it.crop || null,
       // Concat items carry their stitched-from segments here.
       segments:  it.kind === "concat" ? (it.segments || []) : null,
@@ -10690,7 +10888,9 @@ async function loadInitialState() {
           kind: raw.kind,
           name: raw.name || `${raw.kind} ${(+raw.id) || (++maxId)}`,
           thumb: raw.thumb || "",
-          quality: raw.quality || defaultQuality,
+          // normalizeQuality maps legacy "source" → "best" so old sessions
+          // render correctly with the new option list.
+          quality: raw.quality ? normalizeQuality(raw.quality) : defaultQuality,
           crop: (raw.crop && raw.crop.w && raw.crop.h) ? raw.crop : null,
         };
         if (raw.kind === "clip") {
