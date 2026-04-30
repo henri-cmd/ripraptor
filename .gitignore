@@ -1,0 +1,26 @@
+# Build output
+build/
+dist/
+
+# Bundled third-party binaries — fetched on demand by tools/fetch-vendor.sh.
+# Tracking these in git would bloat the repo by ~130MB per release.
+vendor/yt-dlp
+vendor/ffmpeg
+vendor/ffprobe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+*.swp
+
+# Editor
+.vscode/
+.idea/
+
+# Local env
+.env
+*.local
