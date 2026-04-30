@@ -33,21 +33,13 @@
   main {
     max-width: 760px;
     margin: 0 auto;
-    padding: 32px 20px 80px;
-  }
-  /* Hero banner — the same artwork that opens the app. Beveled to match
-     the app's window chrome. */
-  .banner {
-    width: 100%; height: auto;
-    display: block;
-    border: 2px solid;
-    border-color: #fff #404040 #404040 #fff;
+    padding: 48px 20px 80px;
   }
   /* Intro video — autoplays once on load. Same edge-feather mask as the
      in-app title sequence so it blends into the grey background instead
      of showing as a sharp rectangle. */
   .intro {
-    margin: 18px 0 28px;
+    margin: 0 0 8px;
   }
   .intro-video {
     width: 100%; height: auto;
@@ -61,6 +53,17 @@
       linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
       linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
     mask-composite: intersect;
+  }
+  /* Tagline below the intro video — small caps, muted, lets the video
+     do the visual heavy lifting. */
+  .tagline {
+    text-align: center;
+    margin: 0 0 28px;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 4px;
+    color: var(--muted);
+    font-weight: 600;
   }
   /* Download CTA — primary visual focus of the page. Beveled button with
      a press-down :active state. */
@@ -150,16 +153,14 @@
 </head>
 <body>
   <main>
-    <header>
-      <img src="banner.png" alt="Rip Raptor — Internet Video Downloader. The Raptor Can Rip It." class="banner">
-    </header>
-
     <div class="intro">
       <video class="intro-video"
              src="title.mp4"
              autoplay muted playsinline preload="auto"
              aria-hidden="true"></video>
     </div>
+
+    <p class="tagline">Internet Video Downloader</p>
 
     <section class="download">
       <a id="download-btn" class="download-btn"
