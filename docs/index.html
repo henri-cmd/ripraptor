@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rip Raptor — Internet Video Downloader</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Native macOS video downloader. Drop a URL in, get the file out. Built on yt-dlp + ffmpeg with a built-in trim/concat editor.">
+<meta property="og:title" content="Rip Raptor — Internet Video Downloader">
+<meta property="og:description" content="Native macOS video downloader. Drop a URL in, get the file out.">
+<meta property="og:image" content="https://henri-cmd.github.io/ripraptor/banner.png">
+<meta property="og:type" content="website">
+<style>
+  /* Win98-grey palette with modern typography. The page leans into the
+     same chrome the app uses (beveled borders, navy accent) so it feels
+     of-a-piece with what you're downloading. */
+  :root {
+    --bg: #c0c0c0;
+    --fg: #000;
+    --muted: #404040;
+    --card: #d8d8d8;
+    --accent: #000080;
+    --accent-hover: #1010c0;
+    --accent-text: #fff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 32px 20px 80px;
+  }
+  /* Hero banner — the same artwork that opens the app. Beveled to match
+     the app's window chrome. */
+  .banner {
+    width: 100%; height: auto;
+    display: block;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+  }
+  /* Intro video — autoplays once on load. Same edge-feather mask as the
+     in-app title sequence so it blends into the grey background instead
+     of showing as a sharp rectangle. */
+  .intro {
+    margin: 18px 0 28px;
+  }
+  .intro-video {
+    width: 100%; height: auto;
+    display: block;
+    background: transparent;
+    -webkit-mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
+    mask-composite: intersect;
+  }
+  /* Download CTA — primary visual focus of the page. Beveled button with
+     a press-down :active state. */
+  .download {
+    text-align: center;
+    margin: 8px 0 28px;
+  }
+  .download-btn {
+    display: inline-block;
+    padding: 16px 32px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 19px; font-weight: 700;
+    text-decoration: none;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    box-shadow: 3px 3px 0 rgba(0,0,0,0.35);
+    transition: background-color 80ms, transform 80ms, box-shadow 80ms;
+  }
+  .download-btn:hover { background: var(--accent-hover); }
+  .download-btn:active {
+    border-color: #404040 #fff #fff #404040;
+    box-shadow: none;
+    transform: translate(2px, 2px);
+  }
+  .meta {
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  /* Card layout with the same beveled chrome the app uses for sections. */
+  .card {
+    background: var(--card);
+    padding: 18px 22px;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    margin: 18px 0;
+  }
+  .card h2 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: var(--muted);
+  }
+  .card ol, .card ul {
+    margin: 0; padding-left: 20px;
+  }
+  .card li { margin: 6px 0; }
+  .card p { margin: 6px 0; }
+  code {
+    background: #fff;
+    padding: 1px 6px;
+    border: 1px solid var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+  }
+  /* Two-column row for the requirements card so it's compact on desktop
+     and stacks on mobile. */
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+  .row > .card { flex: 1 1 280px; margin: 0; }
+  .links {
+    text-align: center;
+    margin: 24px 0 8px;
+    font-size: 14px;
+  }
+  .links a { color: var(--accent); margin: 0 8px; }
+  .links a:hover { color: var(--accent-hover); }
+  footer {
+    text-align: center;
+    margin-top: 36px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 13px;
+  }
+  @media (max-width: 560px) {
+    main { padding: 16px 12px 60px; }
+    .download-btn { padding: 13px 22px; font-size: 16px; }
+    .banner { border-width: 1px; }
+  }
+</style>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="banner.png" alt="Rip Raptor — Internet Video Downloader. The Raptor Can Rip It." class="banner">
+    </header>
+
+    <div class="intro">
+      <video class="intro-video"
+             src="title.mp4"
+             autoplay muted playsinline preload="auto"
+             aria-hidden="true"></video>
+    </div>
+
+    <section class="download">
+      <a id="download-btn" class="download-btn"
+         href="https://github.com/henri-cmd/ripraptor/releases/download/v0.1.0/Rip-Raptor-0.1.0.dmg">
+        ⬇ Download <span id="version">v0.1.0</span> for Mac
+      </a>
+      <div class="meta">
+        <span id="size">98 MB</span> · Apple Silicon · macOS 12 (Monterey) or newer
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Install</h2>
+      <ol>
+        <li>Open the downloaded <code>.dmg</code>.</li>
+        <li>Drag <strong>Rip Raptor</strong> into your <strong>Applications</strong> folder.</li>
+        <li><strong>First launch only:</strong> right-click the app and pick <strong>Open</strong>, then click <strong>Open</strong> in the dialog. macOS shows a warning for ad-hoc-signed apps the first time; once you click through, double-click works as normal.</li>
+        <li>Drop URLs in, hit <strong>Rip It!</strong></li>
+      </ol>
+    </section>
+
+    <div class="row">
+      <section class="card">
+        <h2>What it does</h2>
+        <ul>
+          <li>Downloads from hundreds of sites via <code>yt-dlp</code>.</li>
+          <li>Pick quality (Best, 2160p / 1440p / 1080p / 720p / 480p / 360p, audio-only).</li>
+          <li>Embeds subtitles and chapters when available.</li>
+          <li>Built-in trim, crop, and concat editor.</li>
+          <li>Send-to-Rip-Raptor bookmarklet for one-click capture from any tab.</li>
+          <li>Persistent searchable history.</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>Requirements</h2>
+        <ul>
+          <li>macOS 12 or newer.</li>
+          <li>Apple Silicon (M1/M2/M3/M4) — Intel Macs not supported in this beta.</li>
+        </ul>
+        <h2 style="margin-top:14px">What's bundled</h2>
+        <ul>
+          <li><code>yt-dlp</code> 2026.03.17</li>
+          <li><code>ffmpeg</code> 8.1 (arm64 static)</li>
+          <li><code>ffprobe</code> 8.1</li>
+        </ul>
+        <p style="font-size:13px; color:var(--muted); margin-top:8px">No Homebrew or pipx required.</p>
+      </section>
+    </div>
+
+    <div class="links">
+      <a href="https://github.com/henri-cmd/ripraptor">Source on GitHub</a>
+      ·
+      <a href="https://github.com/henri-cmd/ripraptor/releases">All releases</a>
+      ·
+      <a href="https://github.com/henri-cmd/ripraptor/issues">Report a bug</a>
+    </div>
+
+    <footer>
+      Created by Henri Scott
+    </footer>
+  </main>
+
+  <script>
+    // Auto-update the download button to point at whatever's the latest
+    // GitHub release. This means the page never goes stale after a new
+    // dmg ships — no site re-deploy needed for version bumps. Falls back
+    // gracefully to the hardcoded v0.1.0 link if GitHub is unreachable.
+    fetch("https://api.github.com/repos/henri-cmd/ripraptor/releases/latest")
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d) return;
+        const dmg = (d.assets || []).find(a => /\.dmg$/i.test(a.name));
+        if (dmg) {
+          document.getElementById("download-btn").href = dmg.browser_download_url;
+          document.getElementById("size").textContent =
+            (dmg.size / 1024 / 1024).toFixed(0) + " MB";
+        }
+        if (d.tag_name) document.getElementById("version").textContent = d.tag_name;
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
