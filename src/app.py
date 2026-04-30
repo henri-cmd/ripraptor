@@ -26,7 +26,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -686,49 +686,82 @@ def _ensure_cached_source(sess: dict) -> str:
         kind = sess["kind"]
         tmp = Path(f"/tmp/rr-edit-{uuid.uuid4().hex[:10]}.{ext}")
         cookies = sess.get("cookies") or []
+        # Reset progress counters — /editor/cache-status reads these to
+        # surface a download bar while the editor's player is still on
+        # the live /proxy stream.
+        sess["cache_bytes"] = 0
+        sess["cache_total"] = 0
+        sess["cache_error"] = ""
         if kind == "mp4":
-            r = _proxy_get(sess["src_url"], cookies, stream=True)
-            if r.status_code not in (200, 206):
-                raise RuntimeError(f"source HTTP {r.status_code}")
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=256 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            try: r.close()
-            except Exception: pass
+            try:
+                r = _proxy_get(sess["src_url"], cookies, stream=True)
+                if r.status_code not in (200, 206):
+                    raise RuntimeError(f"source HTTP {r.status_code}")
+                # Content-Length lets the UI render a determinate bar;
+                # if absent (chunked encoding) we keep total=0 and the
+                # frontend falls back to an indeterminate spinner.
+                try:
+                    sess["cache_total"] = int(r.headers.get("content-length") or 0)
+                except (TypeError, ValueError):
+                    sess["cache_total"] = 0
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            sess["cache_bytes"] = sess.get("cache_bytes", 0) + len(chunk)
+                try: r.close()
+                except Exception: pass
+            except Exception as e:
+                sess["cache_error"] = str(e)
+                raise
         elif kind == "hls":
             # Reuse the existing helper subprocess so impersonation/cookies
-            # match the player's network stack exactly.
-            tmp_ts = tmp.with_suffix(".ts")
-            spec = json.dumps({
-                "manifest_text": _build_local_playlist_text(sess),
-                "manifest_url": sess["manifest_url"],
-                "page_url": sess.get("page_url") or sess["manifest_url"],
-                "cookies": cookies,
-                "out_path": str(tmp_ts),
-            }).encode()
-            if not CURL_PYTHON or not Path(HLS_FETCHER).exists():
-                raise RuntimeError("hls_fetcher unavailable")
-            res = subprocess.run(
-                [CURL_PYTHON, "-u", HLS_FETCHER],
-                input=spec, capture_output=True, timeout=3600,
-            )
-            if not tmp_ts.exists() or tmp_ts.stat().st_size == 0:
-                raise RuntimeError("hls fetch produced empty output")
-            # Remux to a clean MP4 so seeking works frame-accurately.
-            mux_args = [_ffmpeg_bin(), "-y", "-loglevel", "error",
-                        "-i", str(tmp_ts),
-                        "-c", "copy", "-bsf:a", "aac_adtstoasc",
-                        "-movflags", "+faststart", "-fflags", "+genpts",
-                        str(tmp)]
-            mr = subprocess.run(mux_args, capture_output=True, text=True, timeout=600)
-            try: tmp_ts.unlink()
-            except Exception: pass
-            if mr.returncode != 0 or not tmp.exists():
-                tail = (mr.stderr or "").strip().splitlines()
-                raise RuntimeError("remux failed: " + (tail[-1] if tail else "no stderr"))
+            # match the player's network stack exactly. We don't get a
+            # streaming-progress channel here (hls_fetcher is a black-box
+            # subprocess), so cache_total stays 0 and the UI shows an
+            # indeterminate spinner instead of a percent bar.
+            try:
+                tmp_ts = tmp.with_suffix(".ts")
+                spec = json.dumps({
+                    "manifest_text": _build_local_playlist_text(sess),
+                    "manifest_url": sess["manifest_url"],
+                    "page_url": sess.get("page_url") or sess["manifest_url"],
+                    "cookies": cookies,
+                    "out_path": str(tmp_ts),
+                }).encode()
+                if not CURL_PYTHON or not Path(HLS_FETCHER).exists():
+                    raise RuntimeError("hls_fetcher unavailable")
+                res = subprocess.run(
+                    [CURL_PYTHON, "-u", HLS_FETCHER],
+                    input=spec, capture_output=True, timeout=3600,
+                )
+                if not tmp_ts.exists() or tmp_ts.stat().st_size == 0:
+                    raise RuntimeError("hls fetch produced empty output")
+                # Remux to a clean MP4 so seeking works frame-accurately.
+                mux_args = [_ffmpeg_bin(), "-y", "-loglevel", "error",
+                            "-i", str(tmp_ts),
+                            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                            "-movflags", "+faststart", "-fflags", "+genpts",
+                            str(tmp)]
+                mr = subprocess.run(mux_args, capture_output=True, text=True, timeout=600)
+                try: tmp_ts.unlink()
+                except Exception: pass
+                if mr.returncode != 0 or not tmp.exists():
+                    tail = (mr.stderr or "").strip().splitlines()
+                    raise RuntimeError("remux failed: " + (tail[-1] if tail else "no stderr"))
+            except Exception as e:
+                sess["cache_error"] = str(e)
+                raise
         else:
             raise RuntimeError(f"can't cache kind={kind}")
+        # Final size — let the status endpoint display the total even when
+        # the upstream Content-Length wasn't available.
+        try:
+            sess["cache_total"] = max(int(sess.get("cache_total", 0)),
+                                      tmp.stat().st_size)
+            sess["cache_bytes"] = tmp.stat().st_size
+        except OSError:
+            pass
         sess["cached_path"] = str(tmp)
         return str(tmp)
 
@@ -2705,6 +2738,80 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(502); self.end_headers(); return
         self._relay_response(r)
 
+    def _serve_cached_file(self, sess):
+        """Serve sess['cached_path'] with HTTP Range support so the editor
+        player can swap to a local-disk source once the background prefetch
+        finishes. Range parsing here is the same shape the browser uses for
+        seeking, just pointed at a local file instead of an upstream proxy.
+
+        Returns 503 with Retry-After if the cache isn't ready yet — the
+        frontend polls /editor/cache-status and only swaps to /cached/<sid>
+        after that endpoint goes ready, so 503 should be unreachable in
+        practice. Belt-and-suspenders for race conditions."""
+        cached = sess.get("cached_path")
+        if not cached or not os.path.exists(cached):
+            self.send_response(503)
+            self.send_header("Retry-After", "2")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        try:
+            file_size = os.path.getsize(cached)
+        except OSError:
+            self.send_response(503)
+            self.send_header("Retry-After", "2")
+            self.end_headers()
+            return
+        # Parse `Range: bytes=START-END` (single-range only — multi-range is
+        # legal HTTP but no <video> implementation actually emits it).
+        range_h = self.headers.get("Range") or ""
+        start, end = 0, file_size - 1
+        is_partial = False
+        if range_h.startswith("bytes="):
+            try:
+                spec = range_h[6:].split(",", 1)[0].strip()
+                s, _, e = spec.partition("-")
+                if s:
+                    start = int(s)
+                end = int(e) if e else file_size - 1
+                end = min(end, file_size - 1)
+                if start < 0 or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                is_partial = True
+            except (ValueError, AttributeError):
+                # Malformed Range header — fall through to a 200 with the
+                # full body. Browsers will retry with a sane range.
+                start, end, is_partial = 0, file_size - 1, False
+        length = end - start + 1
+        self.send_response(206 if is_partial else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if is_partial:
+            self.send_header("Content-Range",
+                             f"bytes {start}-{end}/{file_size}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            with open(cached, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    remaining -= len(chunk)
+        except Exception:
+            return
+
     def do_OPTIONS(self):
         # CORS preflight for /queue (the bookmarklet) and /thumb (used by
         # gallery picker tiles loading from any origin if proxied externally).
@@ -3106,6 +3213,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sess["keyframes"] = times
             return self._json(200, {"times": times})
 
+        if path == "/editor/cache-status":
+            # Lightweight readiness probe for the background prefetch.
+            # Frontend polls this every couple of seconds and swaps the
+            # player to /cached/<sid> once `ready` flips true. While not
+            # ready, surface bytes/total so the user can see progress;
+            # for HLS sources we don't always know the total upfront, in
+            # which case `total` stays 0 and the UI shows an indeterminate
+            # spinner.
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            sid = (qs.get("sid", [""])[0] or "").strip()
+            sess = _editor_get(sid)
+            if not sess:
+                return self._json(404, {"error": "unknown session"})
+            cached = sess.get("cached_path")
+            ready = bool(cached and os.path.exists(cached))
+            body = {"ready": ready}
+            if ready:
+                try:
+                    body["size"] = os.path.getsize(cached)
+                except OSError:
+                    body["size"] = 0
+            else:
+                body["bytes"] = int(sess.get("cache_bytes", 0))
+                body["total"] = int(sess.get("cache_total", 0))
+                body["error"] = sess.get("cache_error", "")
+            return self._json(200, body)
+
         if path == "/editor/state":
             from urllib.parse import parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -3180,6 +3315,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sess or sess.get("kind") != "mp4":
                 self.send_response(404); self.end_headers(); return
             return self._proxy_mp4(sess)
+
+        if path.startswith("/cached/"):
+            # Local-disk equivalent of /proxy/<sid>. The editor frontend
+            # polls /editor/cache-status and only swaps the player's src
+            # to /cached/<sid> after the background prefetch lands. After
+            # the swap, every seek hits local disk → ~10ms instead of a
+            # CDN round trip. Works for both kind=mp4 and kind=hls
+            # (the HLS path remuxes to mp4 in _ensure_cached_source).
+            sid = path[len("/cached/"):].strip("/")
+            sess = _editor_get(sid)
+            if not sess:
+                self.send_response(404); self.end_headers(); return
+            return self._serve_cached_file(sess)
 
         if path == "/queue/events":
             # Page-side SSE: pushes URLs that arrive at POST /queue (from
@@ -7876,6 +8024,51 @@ EDITOR_HTML = r"""<!doctype html>
     50%      { opacity: 1; }
   }
 
+  /* Cache-prefetch pill — shows progress while the editor is still on
+     the live /proxy stream. Swaps the bar's background to a green
+     "ready" state when /editor/cache-status flips ready, then fades out
+     a few seconds later. */
+  .cache-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10px; padding: 1px 6px;
+    border: 1px solid #404040; background: #c0c0c0;
+    color: #404040;
+    font-family: "MS Sans Serif", Tahoma;
+    transition: opacity 600ms ease-out;
+  }
+  .cache-pill[data-state="ready"] {
+    background: #d8ffd0; color: #003800;
+  }
+  .cache-pill[data-state="error"] {
+    background: #ffd0d0; color: #800000;
+  }
+  .cache-pill .cache-pill-track {
+    display: inline-block;
+    width: 80px; height: 8px;
+    background: #fff;
+    border: 1px solid #404040;
+    overflow: hidden;
+  }
+  .cache-pill .cache-pill-track > span {
+    display: block; height: 100%;
+    background: #80c0ff;
+    transition: width 250ms linear;
+  }
+  /* Indeterminate state — no Content-Length up front, so animate a
+     shimmer instead of a percent bar. */
+  .cache-pill[data-state="loading-indeterminate"] .cache-pill-track > span {
+    background: linear-gradient(90deg,
+      #80c0ff 0%, #c0e0ff 50%, #80c0ff 100%);
+    background-size: 200% 100%;
+    animation: cache-shimmer 1.4s linear infinite;
+  }
+  .cache-pill[data-state="ready"] .cache-pill-track > span { background: #40c060; }
+  .cache-pill[data-state="error"] .cache-pill-track > span { background: #c04040; }
+  @keyframes cache-shimmer {
+    0%   { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+
   /* Shortcut help overlay — same layering as the lightbox. Opened with `?`. */
   #shortcut-help {
     position: fixed; inset: 0; z-index: 10001;
@@ -7968,6 +8161,14 @@ EDITOR_HTML = r"""<!doctype html>
     <span id="save-pill" class="save-pill" data-state="saved" aria-live="polite">
       <span class="save-dot"></span><span id="save-pill-text">Saved</span>
     </span>
+    <!-- Cache-prefetch pill. Shows download progress while the editor
+         is on the live /proxy stream; flips to "Local cache ready" then
+         fades out once swapToCachedSource runs. After the swap, every
+         seek hits local disk instead of paying a CDN round trip. -->
+    <span id="cache-pill" class="cache-pill" data-state="loading" aria-live="polite">
+      <span class="cache-pill-track"><span id="cache-pill-bar"></span></span>
+      <span id="cache-pill-text">Caching…</span>
+    </span>
     <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
     <button id="btn-done" class="pri-action">Done</button>
   </div>
@@ -7977,7 +8178,14 @@ EDITOR_HTML = r"""<!doctype html>
          the video so the user can see the crop region against live
          playback. Hidden by default; shown only while editing the crop. -->
     <div class="player-wrap" id="player-wrap">
-      <video id="player" preload="auto" crossorigin="anonymous" playsinline></video>
+      <!-- preload="metadata" only — for long videos, "auto" buffers
+           multi-MB read-ahead windows from the live /proxy stream which
+           hammers the upstream CDN. Fetching metadata is enough to
+           establish duration + dimensions; further bytes load on demand
+           as the user actually scrubs/plays. Once the background
+           prefetch lands, swapToCachedSource() swaps src to /cached/<sid>
+           and seeks become local-disk-fast. -->
+      <video id="player" preload="metadata" crossorigin="anonymous" playsinline></video>
       <div class="crop-overlay" id="crop-overlay">
         <div class="co-dims" id="co-dims"></div>
         <div class="co-rect" id="co-rect">
@@ -8219,6 +8427,117 @@ player.src = SRC;
 prevVideo.src = SRC;
 try { player.load(); } catch (e) {}
 try { prevVideo.load(); } catch (e) {}
+
+// ───── Local-cache swap ─────────────────────────────────────────────────
+// The server kicks off a background prefetch of the source on /editor/
+// page render. As long as we're on the live /proxy stream every seek
+// pays a CDN round trip; once the cache lands we want to swap to
+// /cached/<sid> so seeks hit local disk. /editor/cache-status returns
+// {ready, bytes, total} — we poll every 2s, render a small progress
+// pill, and call swapToCachedSource() once ready flips true.
+let _cacheSwapped = false;
+let _cachePollHandle = null;
+
+function fmtMB(b) { return (b / (1024 * 1024)).toFixed(0) + "MB"; }
+
+function updateCachePill(ready, bytes, total, errored) {
+  const pill = document.getElementById("cache-pill");
+  const text = document.getElementById("cache-pill-text");
+  const bar  = document.getElementById("cache-pill-bar");
+  if (!pill || !text) return;
+  if (errored) {
+    pill.dataset.state = "error";
+    text.textContent = "Cache failed — using live stream";
+    if (bar) bar.style.width = "0%";
+    setTimeout(() => { pill.style.opacity = "0"; }, 6000);
+    return;
+  }
+  if (ready) {
+    pill.dataset.state = "ready";
+    text.textContent = "Local cache ready";
+    if (bar) bar.style.width = "100%";
+    // Fade out a few seconds after the swap so it doesn't linger.
+    setTimeout(() => { pill.style.opacity = "0"; }, 2400);
+    return;
+  }
+  pill.dataset.state = "loading";
+  if (total > 0) {
+    const pct = Math.min(100, Math.max(0, (bytes / total) * 100));
+    text.textContent = `Caching… ${pct.toFixed(0)}% (${fmtMB(bytes)} / ${fmtMB(total)})`;
+    if (bar) bar.style.width = pct.toFixed(1) + "%";
+  } else if (bytes > 0) {
+    // No content-length up front (chunked / HLS) — show MB downloaded
+    // and let the bar shimmer instead of growing.
+    text.textContent = `Caching… ${fmtMB(bytes)}`;
+    if (bar) bar.style.width = "100%";
+    pill.dataset.state = "loading-indeterminate";
+  } else {
+    text.textContent = "Caching…";
+    if (bar) bar.style.width = "100%";
+    pill.dataset.state = "loading-indeterminate";
+  }
+}
+
+function swapToCachedSource() {
+  if (_cacheSwapped) return;
+  _cacheSwapped = true;
+  const newSrc = `/cached/${SID}`;
+  // Preserve the user's current viewing state across the src change.
+  // <video> resets currentTime to 0 on src change, so we restore it on
+  // the first loadedmetadata event for the new src. If the user was
+  // playing, we resume; if paused, we leave paused.
+  const t = player.currentTime || 0;
+  const wasPaused = player.paused;
+  const onMeta = () => {
+    player.removeEventListener("loadedmetadata", onMeta);
+    try {
+      const cap = (player.duration || t) - 0.001;
+      player.currentTime = Math.max(0, Math.min(cap, t));
+    } catch (e) {}
+    if (!wasPaused) {
+      player.play().catch(() => {});
+    }
+  };
+  player.addEventListener("loadedmetadata", onMeta);
+  player.src = newSrc;
+  // prev-video is the off-screen scrub helper used by the filmstrip /
+  // hover-thumb. Same swap, no time-restore needed (it's seek-on-demand).
+  prevVideo.src = newSrc;
+  try { player.load(); } catch (e) {}
+  try { prevVideo.load(); } catch (e) {}
+}
+
+async function pollCacheStatus() {
+  if (_cacheSwapped) return;
+  try {
+    const r = await fetch(`/editor/cache-status?sid=${encodeURIComponent(SID)}`);
+    if (!r.ok) {
+      _cachePollHandle = setTimeout(pollCacheStatus, 5000);
+      return;
+    }
+    const j = await r.json();
+    if (j.error) {
+      // Backend reported a fatal error — leave the player on /proxy and
+      // surface a one-line warning. The user can still edit; only the
+      // local-disk speedup is unavailable.
+      updateCachePill(false, 0, 0, true);
+      return;
+    }
+    if (j.ready) {
+      updateCachePill(true, j.size || 0, j.size || 0, false);
+      swapToCachedSource();
+      return;
+    }
+    updateCachePill(false, j.bytes || 0, j.total || 0, false);
+    _cachePollHandle = setTimeout(pollCacheStatus, 2000);
+  } catch (e) {
+    _cachePollHandle = setTimeout(pollCacheStatus, 5000);
+  }
+}
+// Kick off after a short delay so the editor has time to render its
+// initial chrome — no point polling before the user can even see the
+// player.
+setTimeout(pollCacheStatus, 1200);
 
 const tl = document.getElementById("tl");
 const tlPlayed = document.getElementById("tl-played");
