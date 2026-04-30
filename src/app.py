@@ -26,13 +26,43 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
 # When running the dev source tree (no Resources/bin/), this dir won't
 # exist — _pick_ytdlp / _FFMPEG fall through to PATH-based discovery.
 _BUNDLED_BIN_DIR = Path(__file__).resolve().parent / "bin"
+
+# URL rewriters — applied at every entry point that takes a user-supplied
+# URL (the page's addUrl, the /queue endpoint). Each entry is
+# (compiled_pattern, builder); the first match wins. Mirrors the JS
+# URL_REWRITERS list in INDEX_HTML so the rewrite happens identically
+# whether the URL arrives via the address-bar paste, a bookmarklet, a
+# curl POST to /queue, or a drag-drop.
+#
+# Currently handles:
+#   IMDB title page → 111movies.net by IMDB id (yt-dlp can rip from
+#   111movies, but not from IMDB itself).
+# IMDB inputs are now handled client-side via the movie/TV prompt
+# (see _detectImdbId + _showImdbPrompt in INDEX_HTML). Backend
+# rewriting can't ask the user, so an IMDB URL hitting /queue from a
+# bookmarklet/script flows through unchanged and the page-side prompt
+# still fires once the SSE listener routes the URL into addUrl().
+# This list stays for future non-interactive rewrites.
+_URL_REWRITERS = []
+
+
+def _rewrite_url(url: str) -> str:
+    """Apply the URL_REWRITERS list to a single URL. Returns the URL
+    unchanged when no rewriter matches. Mirrors the JS _rewriteUrl in
+    INDEX_HTML so backend-only callers (e.g. POST /queue from a script)
+    get the same rewrites the page-level addUrl applies."""
+    for pat, fn in _URL_REWRITERS:
+        m = pat.match(url or "")
+        if m:
+            return fn(m)
+    return url
 
 
 def _ensure_curl_cffi_runtime():
@@ -2252,6 +2282,22 @@ def run_gallery_item(job: dict, item: dict, dest_dir: str,
                 out_path = new_path
                 job["filename"] = out_path
         job["status"] = "done"
+        # Add to history so this gallery item shows up in the History
+        # panel just like a yt-dlp rip would. Source URL is the parent
+        # webpage (the post / album page), so re-rip from history takes
+        # the user back to the carousel picker rather than the dead
+        # one-shot CDN URL we got the asset from.
+        try:
+            history_record(
+                title=title,
+                url=webpage or item_url,
+                file_path=out_path,
+                container=ext,
+                height=height,
+                audio_only=bool(audio_only) if kind == "audio" else False,
+            )
+        except Exception:
+            pass
         q.put({"type": "done", "filename": out_path})
     except Exception as e:
         job["status"] = "error"
@@ -3426,6 +3472,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     return
+                # Apply rewrites server-side too so script callers (curl,
+                # Automator, etc.) get the same treatment the page's
+                # addUrl gives. Idempotent — page-level rewrite re-runs
+                # on the SSE-delivered URL but matches no pattern the
+                # second time.
+                url = _rewrite_url(url)
                 payload = json.dumps({"url": url}).encode()
                 with _QUEUE_LISTENERS_LOCK:
                     listeners = list(_QUEUE_LISTENERS)
@@ -3619,6 +3671,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     target_url = (d.get("url") or "").strip()
                     if not target_url:
                         return self._json(400, {"error": "missing url"})
+                    # Safety net: history's re-rip needs *something* the
+                    # user can re-paste. If the caller forgot page_url,
+                    # fall back to the input target_url so the session
+                    # still has a working URL when history records it.
+                    # Resolved CDN urls (sess["src_url"]) are NEVER a
+                    # safe fallback — they're short-lived signed links.
+                    if not page_url:
+                        page_url = target_url
                     try:
                         sess = _make_editor_session(
                             kind="ytdlp", page_url=page_url, cookies=cookies,
@@ -3647,6 +3707,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 dq = (d.get("default_quality") or "").strip()
                 if dq:
                     sess["default_quality"] = dq
+                # Restore prior items/markers/default_quality from disk
+                # if the user has edited this URL before. The recall is
+                # idempotent — applies after the explicit dq override
+                # above only if no override was given OR the saved
+                # default differs and is more recent.
+                try:
+                    _editor_state_recall(sess)
+                except Exception:
+                    pass
                 return self._json(200, {
                     "sid": sid, "src": src, "kind": sess["kind"],
                     "duration": sess.get("duration", 0.0),
@@ -3671,6 +3740,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # frontend includes them — keeps writes batched together.
                 if "markers" in d and isinstance(d["markers"], list):
                     sess["markers"] = d["markers"]
+                # Persist to URL-keyed disk store so the next time the
+                # user opens this same URL we restore these selections.
+                # Best-effort — disk failure shouldn't fail the save.
+                try:
+                    _editor_state_record(sess)
+                except Exception:
+                    pass
                 return self._json(200, {"ok": True, "count": len(items)})
 
             if path == "/clip":
@@ -3717,9 +3793,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # work in the background — otherwise the JS fetch times out
                 # at ~60s and the user sees a phantom "Load failed".
                 job = make_job()
+                # Capture the metadata we'll need after the encode lands —
+                # the closure's view of `sess` is fine for in-process state
+                # but we want the page URL (for "re-rip" in History) and
+                # the user-visible name even if the session gets GC'd.
+                # NOTE: deliberately do NOT fall back to sess["src_url"] —
+                # that's the resolved CDN URL (signed, expires in minutes).
+                # If page_url is missing, the safety net in /editor/start
+                # has already populated it for ytdlp sessions; mp4/hls
+                # always include it explicitly. Recording an empty url is
+                # the lesser evil vs. recording a dead CDN link.
+                _clip_history_url   = sess.get("page_url") or ""
+                _clip_history_title = base
                 def _run_clip_job(job=job, sess=sess, out=out, start=start,
                                   end=end, container=container, quality=quality,
-                                  crop=crop_arg):
+                                  crop=crop_arg, hist_url=_clip_history_url,
+                                  hist_title=_clip_history_title):
                     q: Queue = job["queue"]
                     try:
                         q.put({"type": "status", "status": "warming cache"})
@@ -3730,6 +3819,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return
                     run_clip(job, src_path, str(out), start, end,
                              container, quality, crop=crop)
+                    # run_clip emits its own done/error events; we only
+                    # touch history on success. Numeric quality strings
+                    # ("1080") become target heights; "best"/"source" map
+                    # to None so the History row doesn't fabricate a
+                    # height that the source might not even have had.
+                    if job.get("status") == "done":
+                        try:
+                            h = int(quality) if str(quality).isdigit() else None
+                        except (TypeError, ValueError):
+                            h = None
+                        try:
+                            history_record(
+                                title=hist_title,
+                                url=hist_url,
+                                file_path=str(out),
+                                container=container,
+                                height=h,
+                                audio_only=False,
+                            )
+                        except Exception:
+                            pass
                 threading.Thread(target=_run_clip_job, daemon=True).start()
                 return self._json(200, {"id": job["id"], "out_path": str(out)})
 
@@ -3769,7 +3879,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Async: return job id, do work in background. Same pattern
                 # as /clip — cache-warm + ffmpeg can take a while.
                 job = make_job()
-                def _run_concat_job(job=job, sess=sess, out=out, clips=clips):
+                _concat_history_url   = sess.get("page_url") or ""
+                _concat_history_title = base
+                def _run_concat_job(job=job, sess=sess, out=out, clips=clips,
+                                    hist_url=_concat_history_url,
+                                    hist_title=_concat_history_title):
                     q: Queue = job["queue"]
                     try:
                         q.put({"type": "status", "status": "warming cache"})
@@ -3783,6 +3897,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except Exception as e:
                         q.put({"type": "error", "error": str(e)})
                         q.put({"type": "_close"})
+                        return
+                    # Concat is always web-safe MP4 — no per-clip codec
+                    # mixing — so the History entry can name the output
+                    # container directly without inspecting the file.
+                    if job.get("status") == "done":
+                        try:
+                            history_record(
+                                title=hist_title,
+                                url=hist_url,
+                                file_path=str(out),
+                                container="mp4-web",
+                                height=None,
+                                audio_only=False,
+                            )
+                        except Exception:
+                            pass
                 threading.Thread(target=_run_concat_job, daemon=True).start()
                 return self._json(200, {"id": job["id"], "out_path": str(out)})
 
@@ -3820,14 +3950,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     k += 1
                 # Same async pattern as /clip — cache-warm can be slow.
                 job = make_job()
+                _still_history_url   = sess.get("page_url") or ""
+                _still_history_title = base
                 def _run_still_job(job=job, sess=sess, out=out, t=t,
-                                   fmt=fmt, quality=quality, crop=crop_arg):
+                                   fmt=fmt, quality=quality, crop=crop_arg,
+                                   hist_url=_still_history_url,
+                                   hist_title=_still_history_title):
                     q: Queue = job["queue"]
                     try:
                         q.put({"type": "status", "status": "warming cache"})
                         src_path = _ensure_cached_source(sess)
                         q.put({"type": "status", "status": "encoding still"})
                         run_still(src_path, str(out), t, fmt, quality, crop=crop)
+                        # Stills are images, so audio_only is meaningless;
+                        # container = format ("jpeg" / "png"), height
+                        # follows the quality dropdown's numeric value.
+                        try:
+                            h = int(quality) if str(quality).isdigit() else None
+                        except (TypeError, ValueError):
+                            h = None
+                        try:
+                            history_record(
+                                title=hist_title,
+                                url=hist_url,
+                                file_path=str(out),
+                                container=fmt,
+                                height=h,
+                                audio_only=False,
+                            )
+                        except Exception:
+                            pass
                         q.put({"type": "done", "filename": str(out)})
                     except Exception as e:
                         q.put({"type": "error", "error": str(e)})
@@ -3853,6 +4005,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._json(500, {"ok": False, "message": str(e)})
                 return self._json(200, res)
+
+            if path == "/history/add":
+                # Frontend-driven history insert. Used by the Swift HLS
+                # finalizer path which writes its output file directly
+                # rather than through a Python job — that path bypasses
+                # the in-job history_record calls used elsewhere, so the
+                # JS onHlsDone handler POSTs here to keep History
+                # complete. Body shape mirrors history_record's kwargs.
+                d = self._read_json()
+                file_path = (d.get("file_path") or "").strip()
+                if not file_path:
+                    return self._json(400, {"error": "file_path required"})
+                try:
+                    history_record(
+                        title=(d.get("title") or "").strip(),
+                        url=(d.get("url") or "").strip(),
+                        file_path=file_path,
+                        container=(d.get("container") or "").strip(),
+                        height=d.get("height"),
+                        audio_only=bool(d.get("audio_only")),
+                        thumbnail=(d.get("thumbnail") or "").strip(),
+                    )
+                except Exception as e:
+                    return self._json(500, {"error": str(e)})
+                return self._json(200, {"ok": True})
 
             if path.startswith("/history/"):
                 # POST /history/<id>/remove → delete that entry. Using
@@ -4576,6 +4753,87 @@ INDEX_HTML = r"""<!doctype html>
     color: #606060;
     margin: 1px 0 4px;
   }
+
+  /* === IMDB movie/TV prompt ============================================
+     Modal shown when the user pastes an IMDB title id (raw "tt12345" or
+     a full imdb.com/title URL). Asks whether to treat it as a movie or
+     a TV episode, and collects season/episode numbers in the latter
+     case before resolving to a 111movies.net URL. Win98-styled card
+     centered over a dim backdrop. */
+  .rr-imdb-modal {
+    position: fixed; inset: 0;
+    z-index: 100002;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .rr-imdb-modal .rr-imdb-card {
+    background: #c0c0c0;
+    color: #000;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    box-shadow: 3px 3px 0 rgba(0,0,0,0.35);
+    padding: 14px 16px;
+    min-width: 320px;
+    max-width: 420px;
+    font-family: "MS Sans Serif", Tahoma, sans-serif;
+  }
+  .rr-imdb-modal h3 {
+    margin: 0 0 8px;
+    font-size: 13px;
+  }
+  .rr-imdb-modal h3 .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #fff;
+    border: 1px solid #404040;
+    padding: 1px 6px;
+    font-weight: normal;
+    font-size: 12px;
+  }
+  .rr-imdb-modal p {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: #404040;
+  }
+  .rr-imdb-modal .rr-imdb-radios {
+    display: flex; gap: 16px;
+    margin: 4px 0 10px;
+    font-size: 12px;
+  }
+  .rr-imdb-modal .rr-imdb-radios label {
+    display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; user-select: none;
+  }
+  .rr-imdb-modal .rr-imdb-radios input[type="radio"] {
+    margin: 0; width: auto; flex: 0 0 auto;
+  }
+  .rr-imdb-modal .rr-imdb-tv {
+    display: flex; gap: 14px;
+    background: #d8d8d8;
+    border: 1px solid #a0a0a0;
+    padding: 8px 10px;
+    margin: 0 0 12px;
+    font-size: 12px;
+  }
+  .rr-imdb-modal .rr-imdb-tv label {
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .rr-imdb-modal .rr-imdb-tv input[type="number"] {
+    width: 56px;
+    flex: 0 0 56px;
+  }
+  .rr-imdb-modal .rr-imdb-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    margin-top: 4px;
+  }
+  .rr-imdb-modal .rr-imdb-actions button {
+    min-width: 72px;
+  }
+  .rr-imdb-modal .rr-imdb-actions .primary {
+    background: #000080;
+    color: #fff;
+    border-color: #fff #404040 #404040 #fff;
+  }
+  .rr-imdb-modal .rr-imdb-actions .primary:hover { background: #1010c0; }
 
   /* === Error popup ====================================================
      Centered video overlay shown on card-level errors. Square 1440x1440
@@ -5346,6 +5604,28 @@ function esc(s){return String(s).replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","
 
 const sniffMap = new Map();
 const canSniff = () => !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vdSniff);
+
+// Hosts that yt-dlp's /probe is known to bounce off — typically
+// JS-rendered streaming front-ends that only expose their actual media
+// after the page loads in a real browser. Pasting a URL on one of these
+// hosts skips the probe round trip and goes straight to the in-page
+// sniffer, which is what /probe would have fallen back to anyway. Pure
+// latency reduction — no behaviour change.
+//
+// Add a host here when you're certain a probe is always going to fail:
+//   - 111movies.net          (target of the IMDB rewrite)
+const SNIFF_ONLY_HOSTS = new Set([
+  "111movies.net",
+  "www.111movies.net",
+]);
+function _isSniffOnly(url) {
+  try {
+    const u = new URL(String(url || ""));
+    return SNIFF_ONLY_HOSTS.has(u.hostname.toLowerCase());
+  } catch (e) {
+    return false;
+  }
+}
 window.__vdSniffResult = function(jsonStr) {
   try {
     const d = JSON.parse(jsonStr);
@@ -5851,6 +6131,18 @@ function updateStatusBar(status) {
 async function probeAndPopulate(card, url) {
   // Shared probe-and-hand-off logic. Used by addUrl on first try, and by
   // card.retryProbe when the user supplies cookies after an auth error.
+
+  // Fast-path: certain hosts (e.g. the 111movies target of the IMDB
+  // rewrite) require the in-page sniffer because yt-dlp can't see their
+  // media without rendering the page. Skip the probe round trip — it
+  // would just fail and fall through to startSniff() anyway. Saves a
+  // few seconds and avoids a misleading "Probing formats…" status.
+  if (_isSniffOnly(url) && canSniff()) {
+    card.el.querySelector(".job-title").value = url;
+    card.startSniff();
+    return { ok: true };
+  }
+
   card.el.dataset.state = "probing";
   card.setStatus('<span class="spinner"></span> Probing formats…');
   let j, errMsg = "", errHint = "";
@@ -5918,20 +6210,154 @@ function _extractUrls(text) {
   return matches.map(u => u.replace(/[.,;:!?)\]]+$/, ""));
 }
 
+// URL rewriters. Each entry is [pattern, builder]; on a match the
+// builder produces the replacement URL. New rewrites are a one-liner —
+// add to the list and both addUrl() and /queue pick them up.
+//
+// IMDB inputs are handled separately via _detectImdbId + the
+// movie/tv prompt below — the prompt resolves to the final 111movies
+// URL before this list is consulted. So this list is intentionally
+// empty for now and exists for future non-IMDB rewrites.
+const URL_REWRITERS = [];
+function _rewriteUrl(url) {
+  for (const [pat, fn] of URL_REWRITERS) {
+    const m = String(url || "").match(pat);
+    if (m) return fn(m);
+  }
+  return url;
+}
+
+// Detect an IMDB title id from any of the shapes the user might type or
+// paste. Returns either null or {id, season?, episode?}; the optional
+// season/episode are extracted from the raw "tt12345/2/5" shorthand so
+// the modal can prefill them.
+function _detectImdbId(text) {
+  const s = String(text || "").trim();
+  // Raw "tt<digits>/<season>/<episode>" — pre-typed series shorthand.
+  let m = s.match(/^(tt\d+)\/(\d+)\/(\d+)\/?$/i);
+  if (m) return { id: m[1].toLowerCase(),
+                  season: parseInt(m[2], 10), episode: parseInt(m[3], 10) };
+  // Raw "tt<digits>" with optional trailing slash.
+  m = s.match(/^(tt\d+)\/?$/i);
+  if (m) return { id: m[1].toLowerCase() };
+  // Full IMDB title URL.
+  m = s.match(/^https?:\/\/(?:www\.)?imdb\.com\/title\/(tt\d+)/i);
+  if (m) return { id: m[1].toLowerCase() };
+  return null;
+}
+
+// Show the movie/TV prompt for an IMDB id and resolve to the final
+// 111movies URL (or null if cancelled). Returns a Promise so addUrl()
+// can pause its flow until the user picks. The modal is Win98-styled
+// to match the rest of the app.
+function _showImdbPrompt(detected) {
+  return new Promise((resolve) => {
+    // If a modal is already open (multi-paste of imdb urls), reuse the
+    // single-flight slot — only one prompt at a time so the user isn't
+    // overwhelmed. Subsequent ones queue via the awaited Promise chain.
+    const existing = document.getElementById("rr-imdb-modal");
+    if (existing) existing.remove();
+    const modal = document.createElement("div");
+    modal.id = "rr-imdb-modal";
+    modal.className = "rr-imdb-modal";
+    const initialKind = detected.season != null ? "tv" : "movie";
+    const initialSeason  = detected.season  != null ? detected.season  : 1;
+    const initialEpisode = detected.episode != null ? detected.episode : 1;
+    modal.innerHTML = `
+      <div class="rr-imdb-card" role="dialog" aria-modal="true"
+           aria-labelledby="rr-imdb-h">
+        <h3 id="rr-imdb-h">IMDB: <span class="mono">${detected.id}</span></h3>
+        <p>Movie or TV episode?</p>
+        <div class="rr-imdb-radios">
+          <label><input type="radio" name="rr-imdb-kind" value="movie"
+                        ${initialKind === "movie" ? "checked" : ""}> Movie</label>
+          <label><input type="radio" name="rr-imdb-kind" value="tv"
+                        ${initialKind === "tv" ? "checked" : ""}> TV episode</label>
+        </div>
+        <div class="rr-imdb-tv" ${initialKind === "movie" ? 'style="display:none;"' : ""}>
+          <label>Season&nbsp;<input id="rr-imdb-season"  type="number" min="1" value="${initialSeason}"></label>
+          <label>Episode&nbsp;<input id="rr-imdb-episode" type="number" min="1" value="${initialEpisode}"></label>
+        </div>
+        <div class="rr-imdb-actions">
+          <button id="rr-imdb-cancel">Cancel</button>
+          <button id="rr-imdb-ok" class="primary">OK</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const tvBox = modal.querySelector(".rr-imdb-tv");
+    const radios = modal.querySelectorAll('input[name="rr-imdb-kind"]');
+    radios.forEach(r => r.addEventListener("change", () => {
+      tvBox.style.display = (r.checked && r.value === "tv") ? "" : "none";
+    }));
+
+    let settled = false;
+    function close(result) {
+      if (settled) return;
+      settled = true;
+      try { modal.remove(); } catch (e) {}
+      resolve(result);
+    }
+    modal.querySelector("#rr-imdb-cancel").addEventListener("click", () => close(null));
+    modal.querySelector("#rr-imdb-ok").addEventListener("click", () => {
+      const kind = modal.querySelector('input[name="rr-imdb-kind"]:checked').value;
+      // 111movies uses two different path roots:
+      //   /movie/<tt-id>            for films
+      //   /tv/<tt-id>/<S>/<E>       for TV episodes
+      // Hardcoding /movie/ for both 404s on series, so split here.
+      let url;
+      if (kind === "tv") {
+        const s = parseInt(modal.querySelector("#rr-imdb-season").value, 10) || 1;
+        const e = parseInt(modal.querySelector("#rr-imdb-episode").value, 10) || 1;
+        url = `https://111movies.net/tv/${detected.id}/${Math.max(1, s)}/${Math.max(1, e)}`;
+      } else {
+        url = `https://111movies.net/movie/${detected.id}`;
+      }
+      close(url);
+    });
+    // Esc cancels, Enter submits — same affordances as a native dialog.
+    modal.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); close(null); }
+      else if (e.key === "Enter") {
+        e.preventDefault();
+        modal.querySelector("#rr-imdb-ok").click();
+      }
+    });
+    // Focus the OK button so Enter immediately confirms the default.
+    setTimeout(() => modal.querySelector("#rr-imdb-ok").focus(), 0);
+  });
+}
+
 async function addUrl() {
   const inp = $("#url");
   const raw = inp.value.trim();
   if (!raw) return;
   inp.value = "";
-  // If the user pasted multiple URLs (newline / space / comma separated)
-  // queue all of them at once.
-  const urls = _extractUrls(raw);
-  if (urls.length === 0) {
-    // Fall back to whatever they typed — maybe a partial URL the probe can
-    // still salvage, maybe a Youtube-style search query yt-dlp can resolve.
-    urls.push(raw);
+  // Build the candidate list. _extractUrls handles multi-URL paste; if
+  // there's no http(s):// match (e.g. a bare "tt1234567"), fall back to
+  // the raw input so the IMDB detector still has a chance.
+  const candidates = _extractUrls(raw);
+  if (candidates.length === 0) candidates.push(raw);
+
+  // Resolve each candidate. IMDB inputs trigger the movie/TV modal so
+  // the user picks how to map the title id to a 111movies URL; the
+  // prompts run sequentially via await so multi-paste of two IMDB
+  // links won't stack two modals on top of each other.
+  const finalUrls = [];
+  for (const cand of candidates) {
+    const detected = _detectImdbId(cand);
+    if (detected) {
+      const resolved = await _showImdbPrompt(detected);
+      if (resolved) finalUrls.push(resolved);
+      // Cancelled → drop this candidate, continue with the rest.
+      continue;
+    }
+    finalUrls.push(_rewriteUrl(cand));
   }
-  for (const url of urls) {
+  if (finalUrls.length === 0) return;
+
+  for (const url of finalUrls) {
     const card = makeCard(url);
     // New cards land in Stage 2 (the staging workshop). They only
     // graduate to Stage 3 (Downloads) when the user clicks Rip It! —
@@ -6499,6 +6925,28 @@ function makeCard(url) {
         b.onclick = () => fetch("/reveal", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({path: savedFile})});
         status.appendChild(b);
       }
+      // The Swift HLS finalizer writes the file directly; no Python
+      // job ran, so history_record never fired. POST /history/add to
+      // keep the History panel in sync. Title falls back to the URL
+      // when the user hasn't renamed the card. Height comes from the
+      // quality dropdown if it's a numeric pick (e.g. "1080").
+      if (savedFile) {
+        const heightVal = parseInt(q.value, 10);
+        const payload = {
+          title: (title.value || "").trim() || url,
+          url: url,
+          file_path: savedFile,
+          container: cont.value || "",
+          height: Number.isFinite(heightVal) ? heightVal : null,
+          audio_only: false,
+        };
+        fetch("/history/add", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload),
+        }).then(() => { try { loadHistory(); } catch (e) {} })
+          .catch(() => {});
+      }
       startBtn.disabled = false; startBtn.textContent = "Rip Again!";
       updateStatusBar();
     },
@@ -6917,6 +7365,11 @@ function makeCard(url) {
       const body = useYtdlp ? {
         kind: "ytdlp",
         url: itemData.webpage_url || itemData.referer || url,
+        // The page URL the user actually pasted on the main page —
+        // critical for History's "re-rip" so the user gets sent back
+        // to the carousel picker, not to the resolved direct CDN URL
+        // (which expires).
+        page_url: url,
         referer: itemData.referer || "",
         title: titleText, filename_hint: titleText,
         default_quality: qualityForEditor(),
@@ -7013,6 +7466,12 @@ function makeCard(url) {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             kind: "ytdlp", url, height, audio_only: audioOnly,
+            // Mirror url into page_url so the editor session knows what
+            // the user originally pasted. History's re-rip uses this so
+            // the user lands back on the input page (YouTube, Twitter,
+            // etc.) rather than the resolved-and-expiring CDN URL that
+            // _resolve_via_ytdlp produces internally.
+            page_url: url,
             generic: useGeneric, referer: "",
             title: titleText, filename_hint: titleText,
             default_quality: qualityForEditor(),
@@ -11362,13 +11821,13 @@ except Exception:
 
 
 # ───── Rip history ───────────────────────────────────────────────────
-# Persistent log of every successful whole-file download. Lets the user
-# revisit past rips, re-download (handy when a file was deleted), or
-# open the original page. Stored as JSON beside our other app data.
-# Editor-derived items (clips, stills, concats) aren't recorded here —
-# they're derivatives of an editor session that no longer exists once
-# the source has been re-fetched, so "re-rip" wouldn't be meaningful
-# without re-running the editor anyway.
+# Persistent log of every successful download. Covers full-file rips
+# (yt-dlp + gallery-dl) AND editor-derived outputs (clips, stills,
+# concats). The "url" field on editor-derived rows points at the parent
+# source URL — clicking re-rip from history re-opens the source so the
+# user can re-edit; we pair this with editor-state.json (URL-keyed
+# selection persistence) so the re-opened editor restores their prior
+# clips/stills/markers.
 HISTORY_PATH = APP_SUPPORT / "history.json"
 HISTORY_MAX = 200       # cap entries so the file doesn't grow forever
 _history_lock = threading.Lock()
@@ -11437,6 +11896,110 @@ def history_remove(entry_id: str) -> bool:
         return False
     _history_save(new_items)
     return True
+
+
+# ───── Editor selection persistence ─────────────────────────────────────
+# Keyed by source URL (page_url, falling back to src_url / url depending
+# on session kind). When the user opens the editor on a URL they've
+# edited before — same machine, same app, same URL — we restore their
+# previous items / markers / default_quality so they don't have to mark
+# in/out points again. Persists across app restarts.
+EDITOR_STATE_PATH = APP_SUPPORT / "editor-state.json"
+EDITOR_STATE_MAX = 100  # cap entries; oldest by saved_at fall off
+_editor_state_lock = threading.Lock()
+
+
+def _editor_state_key(sess: dict) -> str:
+    """Stable URL key for an editor session. Uses the user-visible page
+    URL whenever available so re-pasting the same link finds the same
+    saved selections; falls back to the resolved src_url if there's no
+    page context (rare — direct .mp4 paste with no referer)."""
+    raw = (sess.get("page_url") or sess.get("src_url")
+           or sess.get("url") or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(raw)
+        # Drop fragment + trailing slash; lowercase scheme/host. Query
+        # string is preserved because YouTube / similar use ?v= as the
+        # actual identity. Fragment is always purely client-side state.
+        path = (p.path or "").rstrip("/") or "/"
+        out = f"{p.scheme.lower()}://{p.netloc.lower()}{path}"
+        if p.query:
+            out += f"?{p.query}"
+        return out
+    except Exception:
+        return raw
+
+
+def _editor_state_load() -> dict:
+    with _editor_state_lock:
+        try:
+            if not EDITOR_STATE_PATH.exists():
+                return {}
+            with open(EDITOR_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+
+def _editor_state_save(states: dict) -> None:
+    with _editor_state_lock:
+        try:
+            APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+            # Cap to most-recent N (LRU by saved_at). Without this, a
+            # power user editing dozens of URLs grows the file
+            # unboundedly; 100 is generous for a beta.
+            keep = sorted(
+                states.items(),
+                key=lambda kv: (kv[1] or {}).get("saved_at", 0),
+                reverse=True,
+            )[:EDITOR_STATE_MAX]
+            tmp = EDITOR_STATE_PATH.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(keep), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, EDITOR_STATE_PATH)
+        except Exception:
+            pass
+
+
+def _editor_state_record(sess: dict) -> None:
+    """Persist the session's items/markers/default_quality keyed by URL.
+    Called from /editor/items so every save round-trips through disk."""
+    key = _editor_state_key(sess)
+    if not key:
+        return
+    states = _editor_state_load()
+    states[key] = {
+        "items":           sess.get("items", []),
+        "markers":         sess.get("markers", []),
+        "default_quality": sess.get("default_quality", "best"),
+        "title":           sess.get("title", ""),
+        "filename_hint":   sess.get("filename_hint", ""),
+        "saved_at":        time.time(),
+    }
+    _editor_state_save(states)
+
+
+def _editor_state_recall(sess: dict) -> None:
+    """Restore items/markers/default_quality from disk into a fresh
+    session. Called from /editor/start before responding so the editor
+    HTML page that's about to render sees the prior state."""
+    key = _editor_state_key(sess)
+    if not key:
+        return
+    prev = _editor_state_load().get(key)
+    if not isinstance(prev, dict):
+        return
+    if isinstance(prev.get("items"), list):
+        sess["items"] = prev["items"]
+    if isinstance(prev.get("markers"), list):
+        sess["markers"] = prev["markers"]
+    dq = prev.get("default_quality")
+    if isinstance(dq, str) and dq:
+        sess["default_quality"] = dq
 
 
 # ───── yt-dlp version awareness ──────────────────────────────────────

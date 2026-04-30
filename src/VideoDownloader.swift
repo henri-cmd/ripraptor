@@ -3,37 +3,154 @@ import WebKit
 
 let BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
+/// Locate one of the bundled tools we ship inside the .app
+/// (Contents/Resources/bin/<name>). Falls back to Homebrew / system
+/// paths so the dev source tree (no Resources/bin yet) still works.
+func bundledBinary(_ name: String) -> String? {
+    if let res = Bundle.main.resourcePath {
+        let p = "\(res)/bin/\(name)"
+        if FileManager.default.isExecutableFile(atPath: p) { return p }
+    }
+    return nil
+}
+
 func ffmpegPath() -> String {
+    if let p = bundledBinary("ffmpeg") { return p }
     for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"] {
         if FileManager.default.isExecutableFile(atPath: p) { return p }
     }
     return "/opt/homebrew/bin/ffmpeg"
 }
 
+func ffprobePath() -> String {
+    if let p = bundledBinary("ffprobe") { return p }
+    for p in ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"] {
+        if FileManager.default.isExecutableFile(atPath: p) { return p }
+    }
+    return "/opt/homebrew/bin/ffprobe"
+}
+
+/// MM:SS formatter for the encode-progress status line. We deliberately
+/// don't show milliseconds — the value updates twice a second already
+/// and the precision is just visual noise at that pace.
+func formatMMSS(_ sec: Double) -> String {
+    if !sec.isFinite || sec < 0 { return "00:00" }
+    let total = Int(sec)
+    let m = total / 60
+    let s = total % 60
+    return String(format: "%02d:%02d", m, s)
+}
+
+/// Probe a media file for its container duration (seconds). Used to
+/// translate ffmpeg's `out_time_us=…` progress output into a percentage
+/// during HLS finalization. Returns 0 on any failure — the UI degrades
+/// gracefully to an indeterminate "Encoding…" status.
+func ffprobeDuration(input: String) -> Double {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: ffprobePath())
+    proc.arguments = [
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input,
+    ]
+    let outPipe = Pipe()
+    proc.standardOutput = outPipe
+    proc.standardError = Pipe()
+    do { try proc.run() } catch { return 0 }
+    proc.waitUntilExit()
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let s = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return Double(s) ?? 0
+}
+
+/// Mirrors Python's safe_basename in app.py — replace any path-dangerous
+/// or filesystem-reserved character with "_", trim leading/trailing
+/// whitespace and dots, cap at 180 characters. Without this a card whose
+/// user-visible title is a URL ends up writing to a fictitious path tree
+/// like /Users/x/Downloads/https:/host.net/.../foo.mp4 because both
+/// `appendingPathComponent` and ffmpeg's output writer interpret slashes
+/// in the filename as directory separators.
+func sanitizeBasename(_ s: String) -> String {
+    let bad: Set<Character> = ["/", "\\", ":", "?", "*", "\"", "<", ">", "|"]
+    var out = ""
+    out.reserveCapacity(s.count)
+    for c in s {
+        if let v = c.asciiValue, v < 0x20 {
+            out.append("_")
+        } else if bad.contains(c) {
+            out.append("_")
+        } else {
+            out.append(c)
+        }
+    }
+    let trimmed = out.trimmingCharacters(in: CharacterSet(charactersIn: " ."))
+    let capped = String(trimmed.prefix(180))
+    return capped.isEmpty ? "video" : capped
+}
+
 func ffmpegArgsForHLS(format: String, input: String, base: String) -> (String, [String]) {
     // base is the destination path with no extension. We pick the extension
     // and ffmpeg encoding/copy args based on `format`.
+    // -progress pipe:1 emits machine-readable key=value lines on stdout
+    // every ~0.5s during the encode (out_time_us, frame, fps, etc.) so
+    // we can render a real progress bar instead of just "Encoding…".
+    // -nostats suppresses the human-readable bar that would otherwise
+    // mix into stderr alongside actual error messages.
+    let progressFlags = ["-progress", "pipe:1", "-nostats"]
     switch format {
     case "mp4-h264":
+        // VideoToolbox H.264 — hardware-accelerated on Apple Silicon,
+        // 5–10× faster than libx264 with negligible visual difference at
+        // 8 Mbps. -allow_sw 1 falls back to a software encoder on any
+        // input the HW path refuses (rare, but cheap insurance).
         let out = base + ".mp4"
-        return (out, ["-y", "-loglevel", "error", "-fflags", "+genpts", "-i", input,
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-fflags", "+genpts", "-i", input,
                       "-map", "0:v:0?", "-map", "0:a:0?",
-                      "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                      "-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1",
                       "-c:a", "aac", "-b:a", "192k",
+                      "-movflags", "+faststart",
+                      "-avoid_negative_ts", "make_zero",
+                      out])
+    case "mp4-web":
+        // Web-safe preset constrained to Main@4.0 H.264 + AAC-LC at
+        // 48 kHz stereo, yuv420p, CFR, faststart. VideoToolbox honors
+        // -profile:v / -level so we keep the upload-service-friendly
+        // bitstream characteristics while running on the HW encoder.
+        // Roughly 5–10× faster than the previous libx264 path; if a
+        // user runs into an upload validator that rejects the output
+        // we can wire a fallback toggle, but that's rare in practice.
+        let out = base + ".mp4"
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-fflags", "+genpts", "-i", input,
+                      "-map", "0:v:0?", "-map", "0:a:0?",
+                      "-c:v", "h264_videotoolbox",
+                      "-profile:v", "main", "-level", "4.0",
+                      "-b:v", "8M", "-allow_sw", "1",
+                      "-pix_fmt", "yuv420p",
+                      "-fps_mode", "cfr",
+                      "-c:a", "aac", "-profile:a", "aac_low",
+                      "-ar", "48000", "-ac", "2", "-b:a", "192k",
+                      "-af", "aresample=async=1",
                       "-movflags", "+faststart",
                       "-avoid_negative_ts", "make_zero",
                       out])
     case "mkv":
         let out = base + ".mkv"
-        return (out, ["-y", "-loglevel", "error", "-fflags", "+genpts", "-i", input,
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-fflags", "+genpts", "-i", input,
                       "-c", "copy", "-avoid_negative_ts", "make_zero", out])
     case "mp3":
         let out = base + ".mp3"
-        return (out, ["-y", "-loglevel", "error", "-i", input,
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-i", input,
                       "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out])
     case "m4a":
         let out = base + ".m4a"
-        return (out, ["-y", "-loglevel", "error", "-i", input,
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-i", input,
                       "-vn", "-c:a", "aac", "-b:a", "192k",
                       "-movflags", "+faststart", out])
     default:
@@ -42,7 +159,8 @@ func ffmpegArgsForHLS(format: String, input: String, base: String) -> (String, [
         // AAC; without it, the audio track in the .mp4 won't play. faststart
         // moves moov to the front so QuickTime can open before the EOF.
         let out = base + ".mp4"
-        return (out, ["-y", "-loglevel", "error", "-fflags", "+genpts", "-i", input,
+        return (out, ["-y", "-loglevel", "error"] + progressFlags +
+                     ["-fflags", "+genpts", "-i", input,
                       "-map", "0:v:0?", "-map", "0:a:0?",
                       "-c", "copy", "-bsf:a", "aac_adtstoasc",
                       "-movflags", "+faststart",
@@ -913,14 +1031,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         dl.close()
         let outDir = dl.dest
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
-        let base = (outDir as NSString).appendingPathComponent(dl.filename)
+        // Sanitize first — the JS side passes the card's title field as
+        // the filename, and that field can be a raw URL when the sniffer
+        // didn't find a proper page title. Slashes in a URL would
+        // otherwise nest the output into directory components that
+        // don't exist (and that ffmpeg won't auto-create).
+        let safeFilename = sanitizeBasename(dl.filename)
+        let base = (outDir as NSString).appendingPathComponent(safeFilename)
         let (outPath, args) = ffmpegArgsForHLS(format: dl.format, input: dl.tsPath, base: base)
+        // Quick ffprobe pass to get the input duration. The re-encode's
+        // -progress output emits microseconds-of-output; dividing by
+        // duration_us gives a real percentage. ffprobe on a local .ts
+        // takes 50-100 ms; the value is also used to format ETA.
+        let durationSec = ffprobeDuration(input: dl.tsPath)
+        let durationUs  = durationSec * 1_000_000.0
+        let initialStatus = durationSec > 0
+            ? "Encoding… 0% · 00:00 / \(formatMMSS(durationSec))"
+            : "Encoding…"
+        notifyHls("__vdHlsStatus", taskId: dl.taskId, extra: ["status": initialStatus])
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ffmpegPath())
         proc.arguments = args
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
+
+        // CRITICAL: drain stdout AND stderr asynchronously while the
+        // process runs. macOS Process pipes have a ~64 KB kernel buffer;
+        // if no one reads, ffmpeg blocks on its next write and the whole
+        // process deadlocks indefinitely (terminationHandler never fires
+        // because the process never terminates). The previous version
+        // accumulated stderr inside terminationHandler via
+        // readDataToEndOfFile, which works for short stderr output but
+        // hangs forever on chatty re-encodes (a 30-min video with HLS
+        // discontinuity warnings can easily exceed 64 KB). Drain into
+        // an in-memory buffer here instead, capped so we don't bloat
+        // RAM if something runs amok.
+        let stderrBuf  = NSMutableData()
+        let stderrLock = NSLock()
+        let stdoutBuf  = NSMutableData()  // we don't surface stdout, but we
+        let stdoutLock = NSLock()         // still drain so it can't block.
+        let errPipe = Pipe()
+        let outPipe = Pipe()
+        proc.standardError = errPipe
+        proc.standardOutput = outPipe
+        let cap = 64 * 1024  // tail-trim threshold per stream
+        errPipe.fileHandleForReading.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty {
+                fh.readabilityHandler = nil   // EOF — stop calling us
+                return
+            }
+            stderrLock.lock()
+            stderrBuf.append(chunk)
+            if stderrBuf.length > cap {
+                let drop = stderrBuf.length - cap
+                stderrBuf.replaceBytes(in: NSRange(location: 0, length: drop),
+                                       withBytes: nil, length: 0)
+            }
+            stderrLock.unlock()
+        }
+        // Progress parsing lives in the stdout drain. Each ~0.5s
+        // ffmpeg writes a batch of `key=value` lines ending with
+        // `progress=continue` (or `progress=end` on completion). We
+        // pull `out_time_us=<n>` out, divide by duration_us, and emit
+        // a status update. Throttle isn't needed — ffmpeg already
+        // paces itself via -stats_period (default 0.5s).
+        let taskIdLocal = dl.taskId
+        let progressTail = NSMutableData()
+        let progressLock = NSLock()
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty {
+                fh.readabilityHandler = nil
+                return
+            }
+            stdoutLock.lock()
+            stdoutBuf.append(chunk)
+            if stdoutBuf.length > cap {
+                let drop = stdoutBuf.length - cap
+                stdoutBuf.replaceBytes(in: NSRange(location: 0, length: drop),
+                                       withBytes: nil, length: 0)
+            }
+            stdoutLock.unlock()
+
+            // Buffer chunks across reads — a key=value line can split
+            // across the 4 KB read boundary. Accumulate until we have
+            // newline-terminated text, parse complete lines, keep any
+            // trailing partial line for the next round.
+            progressLock.lock()
+            progressTail.append(chunk)
+            let pending = String(data: progressTail as Data, encoding: .utf8) ?? ""
+            // Find the last newline; everything after is incomplete.
+            let split = pending.split(omittingEmptySubsequences: false,
+                                      whereSeparator: { $0 == "\n" || $0 == "\r" })
+            let completed: [Substring]
+            let leftover: String
+            if pending.hasSuffix("\n") || pending.hasSuffix("\r") {
+                completed = Array(split)
+                leftover = ""
+            } else {
+                completed = Array(split.dropLast())
+                leftover = String(split.last ?? "")
+            }
+            progressTail.length = 0
+            if let lo = leftover.data(using: .utf8) { progressTail.append(lo) }
+            progressLock.unlock()
+
+            for raw in completed {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                guard line.hasPrefix("out_time_us=") else { continue }
+                let v = String(line.dropFirst("out_time_us=".count))
+                guard let us = Double(v), us >= 0 else { continue }
+                let outSec = us / 1_000_000.0
+                let label: String
+                if durationUs > 0 {
+                    let pct = min(100.0, max(0.0, us / durationUs * 100.0))
+                    label = "Encoding… \(Int(pct.rounded()))% · \(formatMMSS(outSec)) / \(formatMMSS(durationSec))"
+                } else {
+                    label = "Encoding… \(formatMMSS(outSec))"
+                }
+                DispatchQueue.main.async {
+                    self?.notifyHls("__vdHlsStatus", taskId: taskIdLocal,
+                                    extra: ["status": label])
+                }
+            }
+        }
         proc.terminationHandler = { [weak self] p in
+            // Disconnect the readability handlers; any further bytes
+            // sitting in the pipe after termination are negligible
+            // (ffmpeg has already stopped writing). We avoid
+            // readDataToEndOfFile here because if a reader handler is
+            // still attached it can race and block.
+            errPipe.fileHandleForReading.readabilityHandler = nil
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            stderrLock.lock()
+            let data = stderrBuf as Data
+            stderrLock.unlock()
+            let stderr = String(data: data, encoding: .utf8) ?? ""
+            let tail = stderr
+                .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .suffix(4)
+                .joined(separator: " | ")
             DispatchQueue.main.async {
                 let ok = (p.terminationStatus == 0)
                 dl.cleanup()
@@ -928,7 +1180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 if ok {
                     self?.notifyHls("__vdHlsDone", taskId: dl.taskId, extra: ["filename": outPath])
                 } else {
-                    self?.notifyHls("__vdHlsError", taskId: dl.taskId, extra: ["error": "ffmpeg failed (status \(p.terminationStatus))"])
+                    let base = "ffmpeg failed (status \(p.terminationStatus))"
+                    let msg = tail.isEmpty ? base : "\(base): \(tail)"
+                    self?.notifyHls("__vdHlsError", taskId: dl.taskId, extra: ["error": msg])
                 }
             }
         }
