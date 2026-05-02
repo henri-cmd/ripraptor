@@ -14,12 +14,25 @@ A native macOS video downloader. Drop a URL in, get the file out. Built around `
 
 ### First-launch Gatekeeper warning
 
-The 0.1 beta is **ad-hoc signed**, not Apple-notarized, so macOS will refuse to open it the normal way. Two options:
+The 0.1 beta is **ad-hoc signed**, not Apple-notarized, so macOS will block the first launch. Two options:
 
-- **Right-click → Open** (then click *Open* in the dialog). Only needed once.
-- Or: `xattr -dr com.apple.quarantine "/Applications/Rip Raptor.app"`.
+**Recommended (works on Sequoia / Sonoma / Ventura):**
 
-After that, double-click works as normal.
+1. Try to open the app once — macOS shows a "can't be opened" dialog. Click **Done**.
+2. Open **System Settings → Privacy & Security**.
+3. Scroll to the security section — there's a banner *"'Rip Raptor' was blocked to protect your Mac"* with an **Open Anyway** button.
+4. Click it, enter your password.
+5. The app launches and the exception sticks forever.
+
+> *Note:* The old "right-click → Open" trick was removed in macOS Sequoia (15). On Sequoia the right-click dialog only offers "Done" and "Move to Bin" — System Settings is the only path.
+
+**One-liner via Terminal (any macOS):**
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Rip Raptor.app"
+```
+
+Strips the quarantine attribute outright. Double-click works after that.
 
 ## Requirements
 

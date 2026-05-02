@@ -176,9 +176,12 @@
       <ol>
         <li>Open the downloaded <code>.dmg</code>.</li>
         <li>Drag <strong>Rip Raptor</strong> into your <strong>Applications</strong> folder.</li>
-        <li><strong>First launch only:</strong> right-click the app and pick <strong>Open</strong>, then click <strong>Open</strong> in the dialog. macOS shows a warning for ad-hoc-signed apps the first time; once you click through, double-click works as normal.</li>
+        <li><strong>First launch only:</strong> double-click the app once — macOS will block it and show a dialog. Click <strong>Done</strong>, then open <strong>System Settings → Privacy &amp; Security</strong>, scroll to the bottom, and click <strong>Open Anyway</strong> next to the "Rip Raptor was blocked" message. Enter your password. The app launches and the exception sticks forever.</li>
         <li>Drop URLs in, hit <strong>Rip It!</strong></li>
       </ol>
+      <p style="font-size: 12px; color: var(--muted); margin-top: 10px;">
+        <strong>Why?</strong> The beta is ad-hoc signed, not Apple-notarized, so macOS Gatekeeper blocks the first launch. The old "right-click → Open" trick was removed in macOS Sequoia (15) — System Settings is now the only path. If you'd rather skip System Settings, run <code>xattr -dr com.apple.quarantine "/Applications/Rip Raptor.app"</code> in Terminal and double-click works after that.
+      </p>
     </section>
 
     <div class="row">
