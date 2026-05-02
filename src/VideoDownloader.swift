@@ -41,6 +41,61 @@ func formatMMSS(_ sec: Double) -> String {
     return String(format: "%02d:%02d", m, s)
 }
 
+/// Inspect codec and pixel/profile info on the first video + first audio
+/// stream of a media file. Used by the smart-copy decision in
+/// finishHLSDownload — if a source's HLS .ts already contains H.264
+/// video + AAC audio (the overwhelming majority of cases), we can
+/// stream-copy into MP4 in seconds instead of re-encoding for minutes.
+struct HLSSourceCodecs {
+    var videoCodec: String  = ""
+    var audioCodec: String  = ""
+    var videoProfile: String = ""
+    var pixFmt: String      = ""
+}
+
+func ffprobeCodecs(input: String) -> HLSSourceCodecs {
+    var out = HLSSourceCodecs()
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: ffprobePath())
+    proc.arguments = [
+        "-v", "error",
+        "-show_streams",
+        "-of", "json",
+        input,
+    ]
+    let outPipe = Pipe()
+    proc.standardOutput = outPipe
+    proc.standardError = Pipe()
+    do { try proc.run() } catch { return out }
+    proc.waitUntilExit()
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let streams = json["streams"] as? [[String: Any]] else { return out }
+    for s in streams {
+        let kind = s["codec_type"] as? String ?? ""
+        if kind == "video" && out.videoCodec.isEmpty {
+            out.videoCodec   = s["codec_name"] as? String ?? ""
+            out.videoProfile = (s["profile"] as? String ?? "").lowercased()
+            out.pixFmt       = s["pix_fmt"] as? String ?? ""
+        } else if kind == "audio" && out.audioCodec.isEmpty {
+            out.audioCodec = s["codec_name"] as? String ?? ""
+        }
+    }
+    return out
+}
+
+/// True iff the source can be stream-copied straight into an MP4 with
+/// only the standard HLS bitstream filter (`aac_adtstoasc`) — meaning
+/// video is H.264 and audio is either AAC or absent. This is true for
+/// the vast majority of HLS streams; falling back to re-encode is the
+/// safety net for the rare source that ships HEVC/Opus/etc.
+func canHlsStreamCopy(input: String) -> Bool {
+    let c = ffprobeCodecs(input: input)
+    if c.videoCodec != "h264" { return false }
+    if !c.audioCodec.isEmpty && c.audioCodec != "aac" { return false }
+    return true
+}
+
 /// Probe a media file for its container duration (seconds). Used to
 /// translate ffmpeg's `out_time_us=…` progress output into a percentage
 /// during HLS finalization. Returns 0 on any failure — the UI degrades
@@ -224,7 +279,7 @@ window.__vdDoHlsDownload = async function(taskId, manifestText, manifestUrl) {
     // sniff, which a curl_cffi subprocess can't easily replicate.
     if (!text && manifestUrl) {
       post({status: 'fetching manifest'});
-      const r = await fetch(manifestUrl, {credentials:'include'});
+      const r = await fetch(manifestUrl, {credentials:'omit', mode:'cors', cache:'no-store'});
       if (!r.ok) throw new Error('manifest ' + r.status);
       text = await r.text();
     }
@@ -245,7 +300,7 @@ window.__vdDoHlsDownload = async function(taskId, manifestText, manifestUrl) {
       variants.sort((a,b) => (b.h - a.h) || (b.bw - a.bw));
       if (variants[0]) {
         baseUrl = variants[0].url;
-        const r = await fetch(baseUrl, {credentials:'include'});
+        const r = await fetch(baseUrl, {credentials:'omit', mode:'cors', cache:'no-store'});
         if (!r.ok) throw new Error('variant ' + r.status);
         text = await r.text();
       }
@@ -264,7 +319,7 @@ window.__vdDoHlsDownload = async function(taskId, manifestText, manifestUrl) {
     }
     post({status: 'segments=' + segs.length});
     if (initUrl) {
-      const r = await fetch(initUrl, {credentials:'include'});
+      const r = await fetch(initUrl, {credentials:'omit', mode:'cors', cache:'no-store'});
       if (!r.ok) throw new Error('init ' + r.status);
       post({chunk: vdAbToB64(await r.arrayBuffer())});
     }
@@ -290,7 +345,7 @@ window.__vdDoHlsDownload = async function(taskId, manifestText, manifestUrl) {
       while (cursor < total && !failed) {
         const i = cursor++;
         try {
-          const r = await fetch(segs[i], {credentials:'include'});
+          const r = await fetch(segs[i], {credentials:'omit', mode:'cors', cache:'no-store'});
           if (!r.ok) throw new Error('segment ' + i + ' ' + r.status);
           buffered.set(i, vdAbToB64(await r.arrayBuffer()));
           done++;
@@ -337,7 +392,7 @@ let SNIFF_JS = """
     await new Promise(r => setTimeout(r, 1200));
     if (m3u8s.has(u)) return;
     try {
-      const r = await fetch(u, {credentials:'include'});
+      const r = await fetch(u, {credentials:'omit', mode:'cors', cache:'no-store'});
       if (!r.ok) return;
       const text = await r.text();
       if (text && text.indexOf('#EXTM3U') !== -1) notePlaylist(u, text);
@@ -950,17 +1005,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let dl = HLSDownload(taskId: taskId, dest: dest, filename: filename, format: format, webView: wv, window: win)
         hlsDownloads[taskId] = dl
 
-        // Drive the download from inside the sniff WebView itself: the JS
-        // function __vdDoHlsDownload (HLS_DOWNLOADER_JS) fetches manifest +
-        // segments via the WebView's network stack — which inherits all
-        // cf_clearance / signed-URL cookies the player established during
-        // sniff. Chunks come back through the vdHlsChunk message handler.
+        // Pull cookies from the sniff WebView's cookie store —
+        // includes any cf_clearance / signed-token cookies the player
+        // established. The Python helper replays them via curl_cffi
+        // with Safari TLS impersonation. We previously experimented
+        // with running the download inside the WebView itself (better
+        // cookie + TLS scope) but ran into CORS preflight failures
+        // on cross-origin worker.dev hosts; the Python path with
+        // hardened retries is more reliable.
         let pageURL = sniffPageURLById[sniffId] ?? manifestUrl
-        // Pull cookies straight from the sniff WebView's cookie store —
-        // these include any cf_clearance / signed-token cookies the
-        // player established. The Python helper will replay them via
-        // curl_cffi with Safari TLS impersonation, which typically gets
-        // through CDNs that 403 Chrome-impersonated requests.
         let cookieStore = wv.configuration.websiteDataStore.httpCookieStore
         cookieStore.getAllCookies { [weak self] cookies in
             self?.runPythonHLS(dl: dl, manifestText: manifestText,
@@ -1038,7 +1091,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         // don't exist (and that ffmpeg won't auto-create).
         let safeFilename = sanitizeBasename(dl.filename)
         let base = (outDir as NSString).appendingPathComponent(safeFilename)
-        let (outPath, args) = ffmpegArgsForHLS(format: dl.format, input: dl.tsPath, base: base)
+
+        // Smart stream-copy decision. When the user picked an .mp4
+        // option (mp4-h264 or mp4-web), check whether the source TS is
+        // already H.264 + AAC — if so, remap to the default "mp4" case
+        // which does a fast stream-copy with the HLS-specific
+        // aac_adtstoasc bitstream filter. Roughly 50-100× faster than
+        // a VideoToolbox re-encode for sources that don't actually
+        // need re-encoding (which is the vast majority of HLS feeds).
+        // Re-encode is only triggered for the edge cases: HEVC sources,
+        // unusual audio codecs, etc.
+        var effectiveFormat = dl.format
+        var fastEncode = false
+        if dl.format == "mp4-h264" || dl.format == "mp4-web" {
+            if canHlsStreamCopy(input: dl.tsPath) {
+                effectiveFormat = "mp4"
+                fastEncode = true
+            }
+        }
+        // mkv is also stream-copy and finishes in seconds — flag it
+        // so the JS bar estimator knows the back end of the rip will
+        // be near-instant. mp3/m4a re-encode but they're audio-only
+        // and typically very fast too.
+        if dl.format == "mkv" { fastEncode = true }
+        if fastEncode {
+            notifyHls("__vdHlsStatus", taskId: dl.taskId, extra: [
+                "status": "Source is fast-remux compatible",
+                "phase":  "encode",
+                "fastEncode": true,
+            ])
+        }
+        let (outPath, args) = ffmpegArgsForHLS(format: effectiveFormat, input: dl.tsPath, base: base)
         // Quick ffprobe pass to get the input duration. The re-encode's
         // -progress output emits microseconds-of-output; dividing by
         // duration_us gives a real percentage. ffprobe on a local .ts
@@ -1143,15 +1226,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 guard let us = Double(v), us >= 0 else { continue }
                 let outSec = us / 1_000_000.0
                 let label: String
+                let pct: Double
                 if durationUs > 0 {
-                    let pct = min(100.0, max(0.0, us / durationUs * 100.0))
+                    pct = min(100.0, max(0.0, us / durationUs * 100.0))
                     label = "Encoding… \(Int(pct.rounded()))% · \(formatMMSS(outSec)) / \(formatMMSS(durationSec))"
                 } else {
+                    pct = -1   // sentinel: unknown duration → JS skips bar update
                     label = "Encoding… \(formatMMSS(outSec))"
                 }
                 DispatchQueue.main.async {
+                    var extra: [String: Any] = [
+                        "status": label,
+                        "phase":  "encode",
+                    ]
+                    if pct >= 0 { extra["percent"] = pct }
                     self?.notifyHls("__vdHlsStatus", taskId: taskIdLocal,
-                                    extra: ["status": label])
+                                    extra: extra)
                 }
             }
         }

@@ -26,7 +26,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -582,6 +582,21 @@ def _parse_variant_segments(text: str, base: str) -> tuple:
     return init_url, segs, total
 
 
+# In-process cache of yt-dlp resolutions. Keyed by (url, height,
+# audio_only, generic, referer, cookies_file, cookies_browser,
+# playlist_items). Value is the same tuple _resolve_via_ytdlp returns.
+# Wins on:
+#   - Editor reopen on the same card (was already cardSid-cached, but
+#     the user closes the editor sometimes which drops cardSid)
+#   - User reopens after a Done → re-Edit cycle
+#   - Multiple cards on the same URL (sniffer carousels, etc.)
+# Cache lives for the session; a process restart re-fetches. Resolved
+# URLs are typically signed CDN tokens with 1-2h expiry; if a cached
+# entry is stale ffmpeg will 403 mid-rip and the user will retry.
+_ytdlp_resolution_cache: dict = {}
+_ytdlp_resolution_lock = threading.Lock()
+
+
 def _resolve_via_ytdlp(url: str, *, height=None, audio_only: bool = False,
                        generic: bool = False, referer: str = "",
                        cookies_file: str = "",
@@ -592,6 +607,13 @@ def _resolve_via_ytdlp(url: str, *, height=None, audio_only: bool = False,
     don't fit a plain <video src>; we restrict the format selector to
     formats that already contain both. Returns (kind, src_url_or_manifest_url,
     manifest_text_or_empty, duration, title)."""
+    cache_key = (url, str(height or ""), bool(audio_only),
+                 bool(generic), referer, cookies_file, cookies_browser,
+                 str(playlist_items or ""))
+    with _ytdlp_resolution_lock:
+        cached = _ytdlp_resolution_cache.get(cache_key)
+    if cached is not None:
+        return cached
     fmt = ("ba/b" if audio_only
            else (f"b[height<={int(height)}]" if (height and str(height) != "best")
                  else "b"))
@@ -625,8 +647,12 @@ def _resolve_via_ytdlp(url: str, *, height=None, audio_only: bool = False,
                            "then edit the file.")
     proto = (info.get("protocol") or "").lower()
     if "m3u8" in proto or direct.endswith(".m3u8"):
-        return ("hls", direct, "", duration, title)
-    return ("mp4", direct, "", duration, title)
+        result = ("hls", direct, "", duration, title)
+    else:
+        result = ("mp4", direct, "", duration, title)
+    with _ytdlp_resolution_lock:
+        _ytdlp_resolution_cache[cache_key] = result
+    return result
 
 
 def _make_editor_session(*, kind: str, page_url: str, cookies: list,
@@ -1803,23 +1829,36 @@ def build_container_args(container: str, audio_only: bool) -> list:
             return ["-x", "--audio-format", "opus", "--audio-quality", "0"]
         return ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     if container == "mp4-web":
-        # Web-safe re-encode for upload services (Readymag, Squarespace,
-        # Webflow, etc.). libx264 Main@4.0 + AAC-LC 48 kHz stereo +
-        # yuv420p + faststart — every box that matters to HTML5 <video>.
-        # No videotoolbox here on purpose: predictable bitstream beats
-        # "fast" when the file's destined for re-validation by a 3rd party.
-        pp = ("VideoConvertor:-c:v libx264 -preset medium -crf 20 "
-              "-profile:v main -level 4.0 -pix_fmt yuv420p "
-              "-c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k "
-              "-movflags +faststart")
-        return ["--merge-output-format", "mp4", "--recode-video", "mp4",
+        # Web-safe target: H.264 Main@4.0 + AAC-LC 48 kHz stereo.
+        # `--format-sort vcodec:h264,acodec:aac` biases yt-dlp toward
+        # H.264 + AAC SOURCE streams so the merge produces a file
+        # that's already QuickTime-compatible — making the recode
+        # pass a no-op in the common case. Only when the source
+        # genuinely lacks H.264 (rare today) does VideoConvertor
+        # actually run, and then it does so on VideoToolbox HW.
+        if VIDEOTOOLBOX.get("h264"):
+            pp = ("VideoConvertor:-c:v h264_videotoolbox "
+                  "-profile:v main -level 4.0 -b:v 8M -allow_sw 1 "
+                  "-pix_fmt yuv420p "
+                  "-c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k "
+                  "-movflags +faststart")
+        else:
+            pp = ("VideoConvertor:-c:v libx264 -preset fast -crf 20 "
+                  "-profile:v main -level 4.0 -pix_fmt yuv420p "
+                  "-c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k "
+                  "-movflags +faststart")
+        return ["--format-sort", "vcodec:h264,acodec:aac",
+                "--merge-output-format", "mp4", "--recode-video", "mp4",
                 "--postprocessor-args", pp]
     if container == "mp4-h264":
         # --recode-video forces a re-encode pass through ffmpeg; we override
         # its ffmpeg args via VideoConvertor: scope. videotoolbox uses bitrate
         # control rather than CRF; pick a high bitrate so quality stays near
         # the libx264 -crf 20 baseline. Audio is normalized to AAC-LC 48 kHz
-        # stereo so embed services don't drop it.
+        # stereo so embed services don't drop it. Same format-sort bias as
+        # mp4-web — most YouTube videos have H.264 source streams natively
+        # so the recode becomes a fast remux rather than a CPU-bound
+        # transcode.
         if VIDEOTOOLBOX.get("h264"):
             pp = ("VideoConvertor:-c:v h264_videotoolbox -b:v 8M -allow_sw 1 "
                   "-pix_fmt yuv420p "
@@ -1830,7 +1869,8 @@ def build_container_args(container: str, audio_only: bool) -> list:
                   "-pix_fmt yuv420p "
                   "-c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k "
                   "-movflags +faststart")
-        return ["--merge-output-format", "mp4", "--recode-video", "mp4",
+        return ["--format-sort", "vcodec:h264,acodec:aac",
+                "--merge-output-format", "mp4", "--recode-video", "mp4",
                 "--postprocessor-args", pp]
     if container == "mp4-h265":
         if VIDEOTOOLBOX.get("hevc"):
@@ -1900,7 +1940,13 @@ def _ensure_aac_in_place(path: str) -> tuple[bool, str]:
     codec = (info.get("codec") or "").lower()
     if not codec or codec == "aac":
         return False, "already aac"
-    tmp = path + ".aacnorm.mp4"
+    # Temp file lives in the system temp dir (not next to the
+    # destination) so a partial / orphaned encode never pollutes the
+    # user's Downloads folder. The os.replace at the end renames
+    # across filesystems if needed.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".mp4", prefix="rr-aacnorm-")
+    os.close(fd)
     cmd = [_ffmpeg_bin(), "-y", "-loglevel", "error",
            "-i", path,
            "-map", "0:v:0", "-map", "0:a:0?",
@@ -1927,6 +1973,83 @@ def _ensure_aac_in_place(path: str) -> tuple[bool, str]:
         except Exception: pass
         return False, f"replace failed: {e}"
     return True, f"{codec} -> aac"
+
+
+def _ensure_h264_in_place(path: str) -> tuple[bool, str]:
+    """If `path` is an mp4 with a non-H.264 video stream (e.g. VP9 or AV1
+    from a YouTube bestvideo merge), re-encode the video stream to H.264
+    in place. Audio is copied — already normalized to AAC by
+    _ensure_aac_in_place. Returns (changed, summary) like the audio
+    sibling.
+
+    Why this exists:
+      yt-dlp's `--recode-video mp4` is a no-op when the merged file is
+      already mp4, so VP9-in-mp4 / AV1-in-mp4 (the common YouTube case)
+      slips through with no actual transcode. QuickTime's mp4 demuxer
+      only handles H.264 / HEVC / ProRes — a VP9 track makes it raise
+      "media isn't compatible" even though the .mp4 container is fine.
+      Forcing H.264 here makes the file open in QuickTime and play
+      everywhere mp4 normally plays.
+    """
+    if not path or not os.path.exists(path):
+        return False, "missing"
+    ffprobe = _ffmpeg_bin().replace("ffmpeg", "ffprobe")
+    if not Path(ffprobe).exists():
+        ffprobe = "ffprobe"
+    cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=codec_name",
+           "-of", "default=nokey=1:noprint_wrappers=1", path]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, f"probe crash: {e}"
+    codec = (res.stdout or "").strip().lower()
+    if not codec:
+        return False, "no video stream"
+    # h264 (a.k.a. avc1) is the QuickTime-friendly default. hevc/h265 are
+    # also fine, but we don't bother re-encoding them either way — if the
+    # source is HEVC, leave it.
+    if codec in ("h264", "hevc", "h265"):
+        return False, f"already {codec}"
+    # Pick the fastest H.264 encoder available. VideoToolbox is hardware
+    # on Apple Silicon — much faster than libx264 with imperceptible
+    # quality difference at our bitrates. Audio is copied (already AAC
+    # by the time we run, since _ensure_aac_in_place ran first).
+    if VIDEOTOOLBOX.get("h264"):
+        v_args = ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1"]
+    else:
+        v_args = ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+    # Temp file in /tmp so orphaned encodes don't litter the user's
+    # save folder. Renamed-into-place via os.replace once ffmpeg
+    # finishes successfully; cleaned up on failure.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".mp4", prefix="rr-h264norm-")
+    os.close(fd)
+    cmd = [_ffmpeg_bin(), "-y", "-loglevel", "error",
+           "-i", path,
+           "-map", "0:v:0", "-map", "0:a:0?"] + v_args + [
+           "-pix_fmt", "yuv420p",
+           "-c:a", "copy",
+           "-movflags", "+faststart",
+           tmp]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except Exception as e:
+        try: os.remove(tmp)
+        except Exception: pass
+        return False, f"ffmpeg crash: {e}"
+    if res.returncode != 0 or not os.path.exists(tmp):
+        try: os.remove(tmp)
+        except Exception: pass
+        tail = (res.stderr or res.stdout or "").strip().splitlines()
+        return False, "ffmpeg rc=%d: %s" % (res.returncode, tail[-1] if tail else "")
+    try:
+        os.replace(tmp, path)
+    except Exception as e:
+        try: os.remove(tmp)
+        except Exception: pass
+        return False, f"replace failed: {e}"
+    return True, f"{codec} -> h264"
 
 
 def safe_basename(s: str) -> str:
@@ -2012,6 +2135,13 @@ def run_download(job: dict, url: str, dest: str, height, audio_only: bool,
             # codec isn't AAC (most commonly Opus from YouTube premium
             # streams), re-encodes audio to AAC-LC in place. No-op when
             # the source already gave us AAC, so cheap to always call.
+            #
+            # Video normalization runs right after — yt-dlp's
+            # `--recode-video mp4` is a no-op when the merged file is
+            # already mp4, so VP9 / AV1 video tracks slip through and
+            # break QuickTime ("media isn't compatible"). _ensure_h264_
+            # in_place forces H.264 when the codec is VP9/AV1 and is a
+            # no-op when the source is already H.264 or HEVC.
             if container in ("mp4", "mp4-h264", "mp4-h265", "mp4-web"):
                 fname = (job.get("filename") or "").strip()
                 if fname:
@@ -2026,6 +2156,18 @@ def run_download(job: dict, url: str, dest: str, height, audio_only: bool,
                     except Exception as e:
                         q.put({"type": "log",
                                "line": f"[audio-normalize] warning: {e}"})
+                    try:
+                        q.put({"type": "status", "status": "Normalizing video codec…"})
+                        changed, why = _ensure_h264_in_place(fname)
+                        if changed:
+                            q.put({"type": "log",
+                                   "line": f"[video-normalize] {why} for QuickTime compat"})
+                        else:
+                            q.put({"type": "log",
+                                   "line": f"[video-normalize] skipped ({why})"})
+                    except Exception as e:
+                        q.put({"type": "log",
+                               "line": f"[video-normalize] warning: {e}"})
             job["status"] = "done"
             # Record this rip in the history log so the user can find,
             # re-rip, or reveal it later. Best-effort — never blocks the
@@ -2953,6 +3095,160 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "checked_at": snap.get("checked", 0),
             })
 
+        if path == "/imdb/title":
+            # Hit IMDB's auto-suggest endpoint (the API the homepage's
+            # search box uses). Returns clean JSON with title + kind
+            # hint, and crucially it doesn't trip the WAF that
+            # imdb.com/title/<id>/ does — that page now returns 202
+            # to non-browser clients pending a JS challenge. The
+            # suggest API is auth-free and keys-free.
+            #   https://v3.sg.media-imdb.com/suggestion/t/<id>.json
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tt = (qs.get("id", [""])[0] or "").strip().lower()
+            if not re.match(r"^tt\d+$", tt):
+                return self._json(400, {"error": "invalid id"})
+            api_url = f"https://v3.sg.media-imdb.com/suggestion/t/{tt}.json"
+            try:
+                r = _proxy_get(api_url, [], stream=False)
+            except Exception as e:
+                return self._json(502, {"error": f"imdb fetch failed: {e}"})
+            if r.status_code != 200:
+                return self._json(502, {"error": f"imdb HTTP {r.status_code}"})
+            try:
+                data = json.loads(r.text)
+            except Exception:
+                return self._json(502, {"error": "imdb response not JSON"})
+            entries = (data.get("d") or [])
+            if not entries:
+                return self._json(404, {"error": "no entries", "id": tt})
+            # The first entry whose id matches our tt is the canonical
+            # one — the suggest API can return cast/related results
+            # alongside the title itself.
+            entry = next((e for e in entries if (e.get("id") or "") == tt), entries[0])
+            title = (entry.get("l") or "").strip()
+            year  = entry.get("y")
+            qid   = (entry.get("qid") or "").strip()  # "movie" / "tvSeries" / ...
+            # Map qid → "movie" | "tv" | "" for the frontend modal.
+            kind = ""
+            if qid in ("movie", "short", "tvMovie", "video"):
+                kind = "movie"
+            elif qid in ("tvSeries", "tvMiniSeries", "tvSpecial", "tvEpisode"):
+                kind = "tv"
+            return self._json(200, {
+                "id":    tt,
+                "title": title,
+                "year":  year,
+                "kind":  kind,
+            })
+
+        if path == "/imdb/search":
+            # Live IMDB title search via the same suggest API the IMDB
+            # homepage uses for autocomplete:
+            #   https://v3.sg.media-imdb.com/suggestion/<first-letter>/<query>.json
+            # Returns ranked title matches with poster thumbs. We
+            # filter to actual movie/TV results — the suggest endpoint
+            # also returns name (actor) results which would just
+            # confuse the picker.
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            query = (qs.get("q", [""])[0] or "").strip()
+            if not query:
+                return self._json(400, {"error": "no query"})
+            # IMDB's suggest path expects: /<first-alnum-char>/<query-with-underscores>.json
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", query).strip("_").lower()
+            if not safe:
+                return self._json(400, {"error": "empty query"})
+            first = safe[0]
+            api_url = f"https://v3.sg.media-imdb.com/suggestion/{first}/{safe}.json"
+            try:
+                r = _proxy_get(api_url, [], stream=False)
+            except Exception as e:
+                return self._json(502, {"error": f"imdb fetch failed: {e}"})
+            if r.status_code != 200:
+                return self._json(502, {"error": f"imdb HTTP {r.status_code}"})
+            try:
+                data = json.loads(r.text)
+            except Exception:
+                return self._json(502, {"error": "imdb response not JSON"})
+            results = []
+            for e in (data.get("d") or []):
+                eid = (e.get("id") or "").strip()
+                if not eid.startswith("tt"):
+                    continue  # name results (nm…) etc. — not titles
+                qid = (e.get("qid") or "").strip()
+                if qid in ("movie", "short", "tvMovie", "video"):
+                    kind = "movie"
+                elif qid in ("tvSeries", "tvMiniSeries", "tvSpecial", "tvEpisode"):
+                    kind = "tv"
+                else:
+                    continue  # unknown qid (podcast, music video, etc.)
+                thumb = ""
+                i = e.get("i")
+                if isinstance(i, dict):
+                    thumb = i.get("imageUrl") or ""
+                results.append({
+                    "id":     eid,
+                    "title":  (e.get("l") or "").strip(),
+                    "year":   e.get("y"),
+                    "kind":   kind,
+                    "qLabel": (e.get("q") or "").strip(),
+                    "thumb":  thumb,
+                    "extra":  (e.get("s") or "").strip(),
+                })
+            return self._json(200, {"query": query, "results": results})
+
+        if path == "/imdb/episodes":
+            # Episode list for an IMDB TV series, sourced from Stremio's
+            # cinemeta — a public, auth-free aggregator that maps IMDB
+            # ids to full season/episode trees with names. Returns
+            # {seasons: [{season:N, episodes:[{episode, name}, ...]}, ...]}.
+            # Season 0 (extras / behind-the-scenes shorts) is filtered
+            # out — the user wants the actual show, not commentary
+            # snippets.
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tt = (qs.get("id", [""])[0] or "").strip().lower()
+            if not re.match(r"^tt\d+$", tt):
+                return self._json(400, {"error": "invalid id"})
+            api_url = f"https://v3-cinemeta.strem.io/meta/series/{tt}.json"
+            try:
+                r = _proxy_get(api_url, [], stream=False)
+            except Exception as e:
+                return self._json(502, {"error": f"cinemeta fetch failed: {e}"})
+            if r.status_code != 200:
+                # 307 = id is a movie, not a series; that's fine, frontend
+                # treats no-seasons as "stay on number inputs".
+                return self._json(200, {"id": tt, "name": "", "seasons": []})
+            try:
+                data = json.loads(r.text)
+            except Exception:
+                return self._json(502, {"error": "cinemeta response not JSON"})
+            meta = data.get("meta") or {}
+            videos = meta.get("videos") or []
+            grouped: dict = {}
+            for v in videos:
+                s = v.get("season")
+                e = v.get("episode")
+                if not isinstance(s, int) or s < 1:
+                    continue
+                if not isinstance(e, int) or e < 1:
+                    continue
+                grouped.setdefault(s, []).append({
+                    "season":  s,
+                    "episode": e,
+                    "name":    (v.get("name") or f"Episode {e}").strip(),
+                })
+            for s in grouped:
+                grouped[s].sort(key=lambda v: v["episode"])
+            seasons = [{"season": s, "episodes": grouped[s]}
+                       for s in sorted(grouped.keys())]
+            return self._json(200, {
+                "id":      tt,
+                "name":    (meta.get("name") or "").strip(),
+                "seasons": seasons,
+            })
+
         if path == "/app/version":
             # Return installed + latest available Rip Raptor versions.
             # Mirrors /yt-dlp/version but compares against the GitHub
@@ -3590,8 +3886,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 page_url = (d.get("page_url") or "").strip()
                 cookies = d.get("cookies") or []
                 out_path = (d.get("out_path") or "").strip()
-                if not manifest_text or not manifest_url or not out_path:
-                    return self._json(400, {"error": "missing manifest_text/manifest_url/out_path"})
+                # manifest_text is OPTIONAL — when the user picks a
+                # "live" variant whose playlist body wasn't captured
+                # during sniff, we leave it empty and the helper
+                # fetches it on demand from manifest_url.
+                if not manifest_url or not out_path:
+                    return self._json(400, {"error": "missing manifest_url/out_path"})
                 spec = json.dumps({
                     "manifest_text": manifest_text,
                     "manifest_url": manifest_url,
@@ -4080,18 +4380,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
 
             if path == "/open-url":
-                # Hand a URL to the system default browser. Strict-whitelisted
-                # to the project's GitHub host — there's no legitimate reason
-                # for the frontend to ask us to open arbitrary URLs, and an
-                # XSS would otherwise turn this into a generic browser-launcher.
+                # Hand a URL to the system default browser. Accepts any
+                # http(s) URL — used for the GitHub release page link
+                # AND for the per-source "open in browser" buttons on
+                # cards (so the user can debug a 111movies/streamimdb
+                # link by viewing it in their actual browser). The
+                # scheme check keeps file:// / smb:// / etc. out so a
+                # hypothetical XSS can't be turned into a local-file
+                # launcher.
                 d = self._read_json()
                 url = (d.get("url") or "").strip()
-                allowed_prefixes = (
-                    "https://github.com/henri-cmd/ripraptor",
-                    "https://api.github.com/repos/henri-cmd/ripraptor",
-                )
-                if not any(url.startswith(p) for p in allowed_prefixes):
-                    return self._json(400, {"error": "url not on whitelist"})
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    return self._json(400, {"error": "only http(s) URLs allowed"})
                 try:
                     subprocess.Popen(["open", url])
                 except Exception as e:
@@ -4334,6 +4634,28 @@ INDEX_HTML = r"""<!doctype html>
     border-color: #404040 #ffffff #ffffff #404040;
   }
   .job-sub { color: #404040; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Per-source "open in browser" buttons. One per source URL the
+     card knows about — IMDB multi-sniff shows two (111movies +
+     streamimdb), single-source pastes show one. */
+  .job-sources {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+  .source-link-btn {
+    font-family: "MS Sans Serif", Tahoma, sans-serif;
+    font-size: 10px;
+    padding: 1px 8px;
+    background: #c0c0c0;
+    color: #000080;
+    border: 1px solid;
+    border-color: #fff #404040 #404040 #fff;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .source-link-btn:hover { background: #d8d8e8; }
+  .source-link-btn:active { border-color: #404040 #fff #fff #404040; }
 
   .options { margin-top: 6px; display: none; flex-wrap: wrap; gap: 4px; align-items: center; }
   .options.show { display: flex; }
@@ -4835,38 +5157,159 @@ INDEX_HTML = r"""<!doctype html>
   }
   .rr-imdb-modal .rr-imdb-actions .primary:hover { background: #1010c0; }
 
-  /* === Error popup ====================================================
-     Centered video overlay shown on card-level errors. Square 1440x1440
-     source video, sized down to fit the viewport with a soft feathered
-     edge so it integrates with the dim backdrop. Click anywhere or wait
-     for the video to end → dismissed. */
-  .rr-error-overlay {
-    position: fixed; inset: 0;
-    z-index: 100000;  /* above the rip overlay (99999) so it always wins */
-    display: flex; align-items: center; justify-content: center;
-    background: rgba(0, 0, 0, 0.45);
-    cursor: pointer;
-    transition: opacity 280ms;
-  }
-  .rr-error-box {
-    width: min(60vw, 480px);
+  /* === IMDB title search ============================================
+     Wider card than the kind/episode modal — the result list needs
+     room. Reuses the .rr-imdb-modal backdrop. */
+  .rr-imdb-modal .rr-imdb-search-card {
+    background: #c0c0c0;
+    color: #000;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    box-shadow: 3px 3px 0 rgba(0,0,0,0.35);
+    padding: 14px 16px;
+    width: 520px;
     max-width: 90vw;
     max-height: 80vh;
-    aspect-ratio: 1 / 1;
-    pointer-events: none;  /* clicks fall through to the overlay's listener */
+    display: flex; flex-direction: column;
+    font-family: "MS Sans Serif", Tahoma, sans-serif;
   }
-  .rr-error-vid {
-    width: 100%; height: 100%;
+  .rr-imdb-modal .rr-imdb-search-card h3 {
+    margin: 0 0 8px;
+    font-size: 13px;
+  }
+  .rr-imdb-modal #rr-search-input {
+    width: 100%;
+    margin-bottom: 8px;
+  }
+  .rr-imdb-modal .rr-search-status {
+    font-size: 11px;
+    color: #404040;
+    margin-bottom: 4px;
+    min-height: 14px;
+  }
+  .rr-imdb-modal #rr-search-results {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    background: #fff;
+    border: 2px solid;
+    border-color: #404040 #ffffff #ffffff #404040;
+    margin-bottom: 10px;
+    min-height: 100px;
+  }
+  /* Empty results pane while idle — matches the inset chrome of the
+     other inset frames in the app. */
+  .rr-imdb-modal #rr-search-results:empty::before {
+    content: "";
     display: block;
-    background: transparent;
-    -webkit-mask-image:
-      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
-      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
-    -webkit-mask-composite: source-in;
-    mask-image:
-      linear-gradient(to right,  transparent 0%, black 7%, black 93%, transparent 100%),
-      linear-gradient(to bottom, transparent 0%, black 7%, black 93%, transparent 100%);
-    mask-composite: intersect;
+    height: 100px;
+  }
+  .rr-search-result {
+    display: flex; gap: 10px;
+    padding: 8px;
+    cursor: pointer;
+    border-bottom: 1px solid #e0e0e0;
+    align-items: center;
+  }
+  .rr-search-result:last-child { border-bottom: none; }
+  .rr-search-result:hover {
+    background: #000080;
+    color: #fff;
+  }
+  .rr-search-result:hover .rr-search-sub { color: #b8c8ff; }
+  .rr-search-thumb {
+    flex: 0 0 auto;
+    width: 48px; height: 72px;
+    object-fit: cover;
+    background: #e0e0e0;
+    border: 1px solid #a0a0a0;
+  }
+  .rr-search-thumb-empty {
+    background: linear-gradient(135deg, #e0e0e0 0%, #c0c0c0 100%);
+  }
+  .rr-search-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .rr-search-title {
+    font-size: 12px;
+    font-weight: bold;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rr-search-sub {
+    font-size: 11px;
+    color: #404040;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* === Error popup ====================================================
+     Win98-style dialog window shown on card-level errors. Plays the
+     "something went wrong" video once, muted, then holds on the last
+     frame until the user closes the window via the title-bar X (or
+     Esc / clicking the backdrop). No feather — sharp rectangular
+     video framed by the beveled window chrome. */
+  .rr-err-popup-overlay {
+    position: fixed; inset: 0;
+    z-index: 100000;  /* above the rip overlay (99999) */
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.35);
+  }
+  .rr-err-popup {
+    background: #c0c0c0;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    box-shadow: 3px 3px 0 rgba(0,0,0,0.5);
+    display: flex; flex-direction: column;
+    width: min(70vw, 540px);
+    max-width: 90vw;
+    max-height: 90vh;
+    font-family: "MS Sans Serif", Tahoma, sans-serif;
+  }
+  .rr-err-popup-titlebar {
+    background: linear-gradient(90deg, #000080 0%, #1084d0 100%);
+    color: #fff;
+    padding: 2px 3px 2px 6px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; font-weight: bold;
+    user-select: none;
+  }
+  .rr-err-popup-title { padding: 0; }
+  .rr-err-popup-close {
+    background: #c0c0c0;
+    color: #000;
+    border: 1px solid;
+    border-color: #fff #404040 #404040 #fff;
+    width: 18px; height: 16px;
+    font-size: 12px;
+    font-weight: bold;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .rr-err-popup-close:active {
+    border-color: #404040 #fff #fff #404040;
+  }
+  .rr-err-popup-body {
+    padding: 4px;
+    background: #c0c0c0;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+  }
+  .rr-err-popup-vid {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: calc(90vh - 24px);
+    background: #000;
+    border: 2px solid;
+    border-color: #404040 #ffffff #ffffff #404040;
   }
 
   /* === Rip Raptor "GET RIPPED!" overlay animation =====================
@@ -4956,7 +5399,7 @@ INDEX_HTML = r"""<!doctype html>
     <fieldset class="panel">
       <legend>2. Extraction</legend>
       <div class="row">
-        <input id="url" placeholder="http://...   (press Enter or click Extract)" autofocus>
+        <input id="url" placeholder="Enter URL" autofocus autocomplete="off" spellcheck="false">
         <button id="btn-paste-url" type="button" onclick="pasteUrlFromClipboard()" title="Paste URL(s) from clipboard">📋 Paste</button>
         <button class="primary" onclick="addUrl()">Extract</button>
       </div>
@@ -5079,7 +5522,26 @@ function setAnimEnabled(name, on) {
   } catch (e) {}
 }
 
-$("#url").addEventListener("keydown", e => { if (e.key === "Enter") addUrl(); });
+// URL bar: plain Enter triggers the existing extract flow.
+$("#url").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.metaKey || e.ctrlKey) return;
+  e.preventDefault();
+  addUrl();
+});
+
+// Global Cmd/Ctrl+Enter: opens the IMDB title search modal from
+// anywhere in the app. If the URL bar has text, that text is used as
+// the initial query and the search fires immediately — so the user
+// can type a title in the URL bar then Cmd+Enter to search for it.
+// No-op if the modal is already open.
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey)) return;
+  if (document.getElementById("rr-imdb-search-modal")) return;
+  e.preventDefault();
+  const inp = document.getElementById("url");
+  const seed = inp ? (inp.value || "").trim() : "";
+  openImdbSearch(seed);
+});
 
 // Drag URLs from any browser tab (or a text file) onto the window: each
 // dropped URL spawns a card. text/uri-list is the canonical drag MIME for
@@ -5600,6 +6062,35 @@ function fmtDur(s) {
            : `${m}:${String(ss).padStart(2,"0")}`;
 }
 
+// Format a "remaining time" value (seconds) into a human-friendly
+// string. Tiers: "<1s" | "Ns" | "M:SS" | "H:MM:00". Used for both the
+// time-based unified-bar ETA and the cache prefetch pill.
+function fmtRemainingSec(sec) {
+  if (!isFinite(sec) || sec < 0) return "";
+  if (sec < 1)    return "<1s";
+  if (sec < 60)   return Math.round(sec) + "s";
+  if (sec < 3600) {
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return m + ":" + String(s).padStart(2, "0");
+  }
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h + ":" + String(m).padStart(2, "0") + ":00";
+}
+
+// Estimate the time remaining from elapsed seconds + a 0..1 progress
+// fraction. Returns "" when the progress is too small to extrapolate
+// reliably (or already effectively finished). Convenience wrapper —
+// callers that already have a remaining-seconds estimate use
+// fmtRemainingSec directly.
+function fmtETA(elapsedSec, progress) {
+  if (!isFinite(elapsedSec) || elapsedSec <= 0) return "";
+  if (!isFinite(progress) || progress <= 0.01 || progress >= 0.999) return "";
+  const total = elapsedSec / progress;
+  return fmtRemainingSec(Math.max(0, total - elapsedSec));
+}
+
 function esc(s){return String(s).replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c]));}
 
 const sniffMap = new Map();
@@ -5613,10 +6104,13 @@ const canSniff = () => !!(window.webkit && window.webkit.messageHandlers && wind
 // latency reduction — no behaviour change.
 //
 // Add a host here when you're certain a probe is always going to fail:
-//   - 111movies.net          (target of the IMDB rewrite)
+//   - 111movies.net          (IMDB modal target — both /movie and /tv)
+//   - streamimdb.ru          (alternate IMDB-id streaming embedder)
 const SNIFF_ONLY_HOSTS = new Set([
   "111movies.net",
   "www.111movies.net",
+  "streamimdb.ru",
+  "www.streamimdb.ru",
 ]);
 function _isSniffOnly(url) {
   try {
@@ -5626,16 +6120,35 @@ function _isSniffOnly(url) {
     return false;
   }
 }
+// sniffMap value shape:
+//   {card, multi: false}              — legacy single-source sniff
+//   {card, multi: true, srcIdx: N}    — one of N parallel multi-sniffs
 window.__vdSniffResult = function(jsonStr) {
   try {
     const d = JSON.parse(jsonStr);
-    const card = sniffMap.get(d.sniffId);
-    if (card) { sniffMap.delete(d.sniffId); card.onSniffResult(d); }
+    const entry = sniffMap.get(d.sniffId);
+    if (!entry) return;
+    sniffMap.delete(d.sniffId);
+    if (entry.multi) {
+      // Promise-based dispatch — startMultiSniff awaits each sniff
+      // before kicking off the next, so it stores its resolver here.
+      if (entry.onResult) entry.onResult(d);
+      else if (entry.card && entry.card.onMultiSniffResult) {
+        entry.card.onMultiSniffResult(entry.srcIdx, d);
+      }
+    } else {
+      entry.card.onSniffResult(d);
+    }
   } catch(e) { console.error(e); }
 };
 window.__vdSniffProgress = function(sniffId, n) {
-  const card = sniffMap.get(sniffId);
-  if (card) card.setStatus(`<span class="spinner"></span> Sniffing in background… ${n} stream${n===1?"":"s"} captured`);
+  const entry = sniffMap.get(sniffId);
+  if (!entry) return;
+  // For multi-sniff we don't show per-source progress (would be noisy
+  // with two simultaneous counters); the card-level "Searching N
+  // sources…" status stays put until results merge.
+  if (entry.multi) return;
+  entry.card.setStatus(`<span class="spinner"></span> Sniffing in background… ${n} stream${n===1?"":"s"} captured`);
 };
 
 const hlsTasks = new Map();
@@ -5878,39 +6391,61 @@ function playRipAnimation(opts) {
 }
 
 // ───── Error animation ──────────────────────────────────────────────────
-// Plays /something-went-wrong.mp4 in a centered popup whenever the app
-// surfaces a card-level error (see card.setStatus's edge-trigger). Single
-// flight: if an overlay is already on screen we bail rather than stack
-// (a Rip All with 5 failures shouldn't spawn 5 overlays).
+// Win98-style dialog window shown when a card transitions to error
+// state (see card.setStatus's edge-trigger). The video plays once,
+// muted, then naturally pauses on its last frame. The popup stays
+// open until the user closes it via the title-bar X (or Esc, or
+// clicking the dim backdrop). Single-flight — if a popup is already
+// up, additional errors don't stack.
 function playErrorAnimation() {
   if (!isAnimEnabled("error")) return;
-  if (document.getElementById("rr-error-overlay")) return;
+  if (document.getElementById("rr-err-popup-overlay")) return;
   const overlay = document.createElement("div");
-  overlay.id = "rr-error-overlay";
-  overlay.className = "rr-error-overlay";
+  overlay.id = "rr-err-popup-overlay";
+  overlay.className = "rr-err-popup-overlay";
   overlay.innerHTML = `
-    <div class="rr-error-box">
-      <video class="rr-error-vid" src="/something-went-wrong.mp4"
-             autoplay playsinline preload="auto"></video>
+    <div class="rr-err-popup" role="dialog" aria-modal="true"
+         aria-labelledby="rr-err-popup-title">
+      <div class="rr-err-popup-titlebar">
+        <span class="rr-err-popup-title" id="rr-err-popup-title">Error</span>
+        <button class="rr-err-popup-close" aria-label="Close">×</button>
+      </div>
+      <div class="rr-err-popup-body">
+        <video class="rr-err-popup-vid" src="/something-went-wrong.mp4"
+               autoplay muted playsinline preload="auto"
+               disableremoteplayback></video>
+      </div>
     </div>`;
+
   let dismissed = false;
   function dismiss() {
     if (dismissed) return;
     dismissed = true;
-    overlay.style.opacity = "0";
-    setTimeout(() => { try { overlay.remove(); } catch(e) {} }, 280);
+    document.removeEventListener("keydown", onKey);
+    try { overlay.remove(); } catch (e) {}
   }
-  overlay.addEventListener("click", dismiss);
+  function onKey(e) {
+    if (e.key === "Escape") { e.preventDefault(); dismiss(); }
+  }
+
+  overlay.querySelector(".rr-err-popup-close").addEventListener("click", dismiss);
+  // Click the dim backdrop (overlay element itself, not the popup
+  // card) closes — matches the IMDB modal affordance.
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) dismiss();
+  });
+  document.addEventListener("keydown", onKey);
+
   const vid = overlay.querySelector("video");
   if (vid) {
-    vid.addEventListener("ended", dismiss);
+    // Deliberately NO `ended` handler — the video naturally pauses
+    // on its last frame and the popup stays open until the user X's
+    // out. `error` still dismisses; if the file 404s or fails to
+    // decode there's no point keeping a broken popup up.
     vid.addEventListener("error", dismiss);
-    // Safety: any video that runs longer than 8s (or fails to fire `ended`)
-    // gets dismissed anyway so we don't lock the foreground forever.
-    setTimeout(dismiss, 8000);
-    vid.play().catch(() => dismiss());
-  } else {
-    dismiss();
+    // muted autoplay should always work in modern browsers — no
+    // fallback dismiss on play() failure.
+    vid.play().catch(() => {});
   }
   document.body.appendChild(overlay);
 }
@@ -6246,11 +6781,179 @@ function _detectImdbId(text) {
   return null;
 }
 
-// Show the movie/TV prompt for an IMDB id and resolve to the final
-// 111movies URL (or null if cancelled). Returns a Promise so addUrl()
-// can pause its flow until the user picks. The modal is Win98-styled
-// to match the rest of the app.
-function _showImdbPrompt(detected) {
+// Open a live IMDB title search modal. User types a query → we
+// debounce-fetch /imdb/search → render results with poster thumbs →
+// click a result to feed its tt-id straight into addUrl(), which then
+// runs the existing IMDB pipeline (movie/TV modal + multi-sniff +
+// auto-name). The modal is dismissable via Esc, Cancel, or clicking
+// the dim backdrop.
+//
+// `initialQuery` (optional) pre-fills the search input and runs the
+// query immediately — used when the user hits Cmd+Enter with text
+// already in the URL bar so the modal opens already-populated.
+function openImdbSearch(initialQuery) {
+  if (document.getElementById("rr-imdb-search-modal")) return;
+  const modal = document.createElement("div");
+  modal.id = "rr-imdb-search-modal";
+  modal.className = "rr-imdb-modal";  // reuse backdrop styling
+  modal.innerHTML = `
+    <div class="rr-imdb-search-card" role="dialog" aria-modal="true"
+         aria-labelledby="rr-imdb-s-h">
+      <h3 id="rr-imdb-s-h">Search IMDB</h3>
+      <input id="rr-search-input" type="text"
+             placeholder="Title — e.g. Game of Thrones, The Dark Knight"
+             autocomplete="off" spellcheck="false">
+      <div id="rr-search-status" class="rr-search-status">
+        Type a title to search.
+      </div>
+      <div id="rr-search-results"></div>
+      <div class="rr-imdb-actions">
+        <button id="rr-search-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const inputEl   = modal.querySelector("#rr-search-input");
+  const statusEl  = modal.querySelector("#rr-search-status");
+  const resultsEl = modal.querySelector("#rr-search-results");
+
+  let closed = false;
+  function close() {
+    if (closed) return;
+    closed = true;
+    try { modal.remove(); } catch (e) {}
+  }
+  modal.querySelector("#rr-search-cancel").addEventListener("click", close);
+  modal.addEventListener("click", (e) => {
+    // Click on the dim backdrop (modal itself, not the card) closes.
+    if (e.target === modal) close();
+  });
+  modal.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+  });
+
+  let timer = null;
+  let lastQuery = "";  // outdated-response guard for racing fetches
+  inputEl.addEventListener("input", () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    const q = inputEl.value.trim();
+    if (!q) {
+      lastQuery = "";
+      statusEl.textContent = "Type a title to search.";
+      resultsEl.innerHTML = "";
+      return;
+    }
+    timer = setTimeout(() => doSearch(q), 250);
+  });
+
+  async function doSearch(q) {
+    lastQuery = q;
+    statusEl.textContent = "Searching…";
+    let j;
+    try {
+      const r = await fetch(`/imdb/search?q=${encodeURIComponent(q)}`);
+      if (!r.ok) {
+        if (q !== lastQuery) return;
+        statusEl.textContent = "Search failed (HTTP " + r.status + ")";
+        return;
+      }
+      j = await r.json();
+    } catch (e) {
+      if (q !== lastQuery) return;
+      statusEl.textContent = "Search error: " + (e.message || e);
+      return;
+    }
+    if (q !== lastQuery) return;  // a newer query landed first; drop this
+    const list = j.results || [];
+    if (list.length === 0) {
+      statusEl.textContent = "No results.";
+      resultsEl.innerHTML = "";
+      return;
+    }
+    statusEl.textContent = `${list.length} result${list.length === 1 ? "" : "s"}`;
+    resultsEl.innerHTML = "";
+    for (const item of list) {
+      const row = document.createElement("div");
+      row.className = "rr-search-result";
+      row.dataset.id = item.id;
+      row.dataset.kind = item.kind;
+      const yearStr = item.year ? ` (${item.year})` : "";
+      const subBits = [item.qLabel, item.extra].filter(Boolean);
+      // referrerpolicy=no-referrer keeps IMDB CDN happy when their
+      // poster URLs are loaded from a non-imdb host.
+      const thumbHtml = item.thumb
+        ? `<img class="rr-search-thumb" src="${item.thumb}" alt="" referrerpolicy="no-referrer">`
+        : `<div class="rr-search-thumb rr-search-thumb-empty"></div>`;
+      row.innerHTML = `
+        ${thumbHtml}
+        <div class="rr-search-meta">
+          <div class="rr-search-title">${esc(item.title)}${yearStr}</div>
+          <div class="rr-search-sub">${esc(subBits.join(" · "))}</div>
+        </div>
+      `;
+      row.addEventListener("click", () => {
+        close();
+        const inp = $("#url");
+        if (inp) {
+          inp.value = item.id;
+          addUrl();
+        }
+      });
+      resultsEl.appendChild(row);
+    }
+  }
+
+  // Seed-search support: if Cmd+Enter was hit with text in the URL
+  // bar, plug it into the input and kick off the search now (no
+  // debounce — the user already showed intent). Select all so the
+  // user can immediately type to replace if the seed wasn't quite
+  // what they wanted.
+  setTimeout(() => {
+    inputEl.focus();
+    if (initialQuery && initialQuery.trim()) {
+      inputEl.value = initialQuery.trim();
+      inputEl.select();
+      doSearch(inputEl.value.trim());
+    }
+  }, 0);
+}
+
+// Build the candidate URL list for an IMDB title. We sniff every entry
+// in parallel via startMultiSniff and merge the variants into a single
+// quality dropdown — so the user sees the best option from any source.
+// New streaming front-ends are a one-liner — append a builder here.
+function _imdbCandidateUrls(detected) {
+  const id = detected.id;
+  if (detected.kind === "tv") {
+    const s = Math.max(1, parseInt(detected.season, 10) || 1);
+    const e = Math.max(1, parseInt(detected.episode, 10) || 1);
+    return [
+      `https://111movies.net/tv/${id}/${s}/${e}`,
+      `https://streamimdb.ru/embed/tv/${id}/${s}/${e}`,
+    ];
+  }
+  return [
+    `https://111movies.net/movie/${id}`,
+    `https://streamimdb.ru/embed/movie/${id}`,
+  ];
+}
+
+// Show the movie/TV prompt for an IMDB id. Resolves to {kind, season?,
+// episode?} (or null if cancelled). The caller turns this into the
+// candidate URL list via _imdbCandidateUrls. Modal is Win98-styled to
+// match the rest of the app.
+//
+// Optional `metaPromise` is a Promise<{kind, title, year}> from
+// /imdb/title. When it resolves before the user has touched the radio,
+// we flip the movie/TV selection to whatever IMDB says.
+//
+// Optional `episodesPromise` is a Promise<{seasons:[{season, episodes:
+// [{episode, name}]}]}> from /imdb/episodes. When it resolves with
+// non-empty seasons, the TV section's number inputs get replaced with
+// season + episode-name dropdowns so the user picks by title rather
+// than guessing numbers.
+function _showImdbPrompt(detected, metaPromise, episodesPromise) {
   return new Promise((resolve) => {
     // If a modal is already open (multi-paste of imdb urls), reuse the
     // single-flight slot — only one prompt at a time so the user isn't
@@ -6275,8 +6978,14 @@ function _showImdbPrompt(detected) {
                         ${initialKind === "tv" ? "checked" : ""}> TV episode</label>
         </div>
         <div class="rr-imdb-tv" ${initialKind === "movie" ? 'style="display:none;"' : ""}>
-          <label>Season&nbsp;<input id="rr-imdb-season"  type="number" min="1" value="${initialSeason}"></label>
-          <label>Episode&nbsp;<input id="rr-imdb-episode" type="number" min="1" value="${initialEpisode}"></label>
+          <div class="rr-imdb-num-inputs">
+            <label>Season&nbsp;<input id="rr-imdb-season"  type="number" min="1" value="${initialSeason}"></label>
+            <label>Episode&nbsp;<input id="rr-imdb-episode" type="number" min="1" value="${initialEpisode}"></label>
+          </div>
+          <div class="rr-imdb-dropdowns" style="display:none;">
+            <label>Season&nbsp;<select id="rr-imdb-season-sel"></select></label>
+            <label>Episode&nbsp;<select id="rr-imdb-episode-sel"></select></label>
+          </div>
         </div>
         <div class="rr-imdb-actions">
           <button id="rr-imdb-cancel">Cancel</button>
@@ -6288,9 +6997,91 @@ function _showImdbPrompt(detected) {
 
     const tvBox = modal.querySelector(".rr-imdb-tv");
     const radios = modal.querySelectorAll('input[name="rr-imdb-kind"]');
+    let userTouched = false;
     radios.forEach(r => r.addEventListener("change", () => {
+      userTouched = true;
       tvBox.style.display = (r.checked && r.value === "tv") ? "" : "none";
     }));
+
+    // If we have a metaPromise, update kind selection + heading once
+    // it resolves — but only if the user hasn't manually flipped the
+    // radio yet. Also surface the looked-up title in the heading so
+    // the user has confidence the right title was matched.
+    const headingEl = modal.querySelector("#rr-imdb-h");
+    if (metaPromise && headingEl) {
+      metaPromise.then(meta => {
+        if (!meta) return;
+        if (meta.title) {
+          headingEl.innerHTML = `${esc(meta.title)}${meta.year ? ` (${meta.year})` : ""}<br><span class="mono" style="font-weight:normal">${esc(detected.id)}</span>`;
+        }
+        if (meta.kind && !userTouched && (meta.kind === "movie" || meta.kind === "tv")) {
+          const radio = modal.querySelector(`input[name="rr-imdb-kind"][value="${meta.kind}"]`);
+          if (radio && !radio.checked) {
+            radio.checked = true;
+            tvBox.style.display = meta.kind === "tv" ? "" : "none";
+          }
+        }
+      });
+    }
+
+    // Episode-name dropdowns. Sourced from cinemeta. When this resolves
+    // with a non-empty seasons list, swap the number inputs for two
+    // <select> dropdowns: Season N + "1. Episode Name" entries. We
+    // sync any value the user already typed into the numbers so the
+    // dropdown opens on whatever they were aiming at.
+    const numBox = modal.querySelector(".rr-imdb-num-inputs");
+    const ddBox  = modal.querySelector(".rr-imdb-dropdowns");
+    const selSeason  = modal.querySelector("#rr-imdb-season-sel");
+    const selEpisode = modal.querySelector("#rr-imdb-episode-sel");
+    let episodesIndex = null;  // {seasonNum: [{episode, name}, ...]}
+    function populateEpisodes(seasonNum) {
+      selEpisode.innerHTML = "";
+      if (!episodesIndex) return;
+      const eps = episodesIndex[String(seasonNum)] || [];
+      for (const ep of eps) {
+        const o = document.createElement("option");
+        o.value = String(ep.episode);
+        o.dataset.epname = ep.name || "";
+        o.textContent = `${ep.episode}. ${ep.name}`;
+        selEpisode.appendChild(o);
+      }
+    }
+    if (episodesPromise && selSeason && selEpisode) {
+      episodesPromise.then(eps => {
+        if (!eps || !Array.isArray(eps.seasons) || !eps.seasons.length) return;
+        // Build season-number index for quick lookup on change events.
+        episodesIndex = {};
+        for (const s of eps.seasons) {
+          episodesIndex[String(s.season)] = s.episodes || [];
+        }
+        // Populate Season dropdown.
+        selSeason.innerHTML = "";
+        for (const s of eps.seasons) {
+          const o = document.createElement("option");
+          o.value = String(s.season);
+          o.textContent = `Season ${s.season}`;
+          selSeason.appendChild(o);
+        }
+        // Sync dropdown selection to whatever the user has in the
+        // number inputs (which start out at 1/1 or whatever was
+        // detected from "tt12345/2/5"). If their typed season/episode
+        // doesn't exist in the cinemeta data, fall back to S1E1.
+        const numSeason  = parseInt(modal.querySelector("#rr-imdb-season").value, 10)  || 1;
+        const numEpisode = parseInt(modal.querySelector("#rr-imdb-episode").value, 10) || 1;
+        const seasonOpt = [...selSeason.options].find(o => o.value === String(numSeason));
+        if (seasonOpt) selSeason.value = String(numSeason);
+        populateEpisodes(parseInt(selSeason.value, 10));
+        const epOpt = [...selEpisode.options].find(o => o.value === String(numEpisode));
+        if (epOpt) selEpisode.value = String(numEpisode);
+        // Re-populate episodes when the season changes.
+        selSeason.addEventListener("change", () => {
+          populateEpisodes(parseInt(selSeason.value, 10));
+        });
+        // Swap visibility: dropdowns over numbers.
+        if (numBox) numBox.style.display = "none";
+        if (ddBox)  ddBox.style.display  = "";
+      });
+    }
 
     let settled = false;
     function close(result) {
@@ -6302,19 +7093,25 @@ function _showImdbPrompt(detected) {
     modal.querySelector("#rr-imdb-cancel").addEventListener("click", () => close(null));
     modal.querySelector("#rr-imdb-ok").addEventListener("click", () => {
       const kind = modal.querySelector('input[name="rr-imdb-kind"]:checked').value;
-      // 111movies uses two different path roots:
-      //   /movie/<tt-id>            for films
-      //   /tv/<tt-id>/<S>/<E>       for TV episodes
-      // Hardcoding /movie/ for both 404s on series, so split here.
-      let url;
+      const choice = { id: detected.id, kind };
       if (kind === "tv") {
-        const s = parseInt(modal.querySelector("#rr-imdb-season").value, 10) || 1;
-        const e = parseInt(modal.querySelector("#rr-imdb-episode").value, 10) || 1;
-        url = `https://111movies.net/tv/${detected.id}/${Math.max(1, s)}/${Math.max(1, e)}`;
-      } else {
-        url = `https://111movies.net/movie/${detected.id}`;
+        // Read from whichever set is visible. The dropdowns appear
+        // when cinemeta returned episode data; otherwise the number
+        // inputs stay live and editable.
+        const dropdownsActive = ddBox && ddBox.style.display !== "none";
+        if (dropdownsActive) {
+          choice.season  = parseInt(selSeason.value, 10)  || 1;
+          choice.episode = parseInt(selEpisode.value, 10) || 1;
+          // Carry the episode name through so the filename autoname
+          // below can build "Series - S01E01 - Episode Title".
+          const epOpt = selEpisode.selectedOptions[0];
+          if (epOpt) choice.episodeName = epOpt.dataset.epname || "";
+        } else {
+          choice.season  = parseInt(modal.querySelector("#rr-imdb-season").value, 10) || 1;
+          choice.episode = parseInt(modal.querySelector("#rr-imdb-episode").value, 10) || 1;
+        }
       }
-      close(url);
+      close(choice);
     });
     // Esc cancels, Enter submits — same affordances as a native dialog.
     modal.addEventListener("keydown", (e) => {
@@ -6340,22 +7137,70 @@ async function addUrl() {
   const candidates = _extractUrls(raw);
   if (candidates.length === 0) candidates.push(raw);
 
-  // Resolve each candidate. IMDB inputs trigger the movie/TV modal so
-  // the user picks how to map the title id to a 111movies URL; the
-  // prompts run sequentially via await so multi-paste of two IMDB
-  // links won't stack two modals on top of each other.
-  const finalUrls = [];
+  // Resolve each candidate. IMDB inputs trigger the movie/TV modal,
+  // then spawn a single card that sniffs N streaming front-ends in
+  // parallel (111movies + streamimdb at minimum) and merges every
+  // variant into one quality dropdown. Non-IMDB candidates take the
+  // existing single-URL path (probe → sniff fallback).
+  const imdbJobs = [];   // {choice, urls, titlePromise} for IMDB inputs
+  const finalUrls = [];  // plain URLs that go through the legacy path
   for (const cand of candidates) {
     const detected = _detectImdbId(cand);
     if (detected) {
-      const resolved = await _showImdbPrompt(detected);
-      if (resolved) finalUrls.push(resolved);
-      // Cancelled → drop this candidate, continue with the rest.
+      // Fire both IMDB lookups the moment we recognise the id — they
+      // overlap with the modal showing. Title gives us the kind hint
+      // (auto-flips Movie/TV) and the year. Episodes gives us per-
+      // season episode names (replaces number inputs with named
+      // dropdowns once it lands; if it's a movie, cinemeta returns
+      // empty seasons and the modal stays on number inputs).
+      const metaPromise = fetch(`/imdb/title?id=${encodeURIComponent(detected.id)}`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null);
+      const episodesPromise = fetch(`/imdb/episodes?id=${encodeURIComponent(detected.id)}`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null);
+      const choice = await _showImdbPrompt(detected, metaPromise, episodesPromise);
+      if (!choice) continue;  // user cancelled
+      const urls = _imdbCandidateUrls(choice);
+      imdbJobs.push({ choice, urls, titlePromise: metaPromise });
       continue;
     }
     finalUrls.push(_rewriteUrl(cand));
   }
-  if (finalUrls.length === 0) return;
+  if (finalUrls.length === 0 && imdbJobs.length === 0) return;
+
+  // Spawn cards for IMDB jobs first (they tend to be the user's
+  // primary intent), each driving a multi-sniff under the hood.
+  for (const job of imdbJobs) {
+    // The card's nominal URL is the first candidate (111movies). It's
+    // the referer/identity used in the UI; the sniff merge is what
+    // actually surfaces variants from every source.
+    const cardUrl = job.urls[0];
+    const card = makeCard(cardUrl);
+    $("#pending").prepend(card.el);
+    updateStatusBar();
+    refreshRipAllButton();
+    refreshPendingToolbar();
+    // Auto-name from IMDB once that fetch lands. For TV episodes we
+    // build "Series - S01E01 - Episode Title" so the saved file is
+    // self-describing without the user having to type anything. Don't
+    // block sniff — even if IMDB is unreachable the rip still works
+    // (the user can type a name in).
+    job.titlePromise.then(j => {
+      if (!j || !j.title) return;
+      let fn = j.title;
+      const c = job.choice;
+      if (c.kind === "tv" && c.season && c.episode) {
+        const sNum = String(c.season).padStart(2, "0");
+        const eNum = String(c.episode).padStart(2, "0");
+        fn = `${j.title} - S${sNum}E${eNum}`;
+        if (c.episodeName) fn += ` - ${c.episodeName}`;
+      }
+      const inp = card.el.querySelector(".job-title");
+      if (inp && !inp.value.trim()) inp.value = fn;
+    });
+    card.startMultiSniff(job.urls);
+  }
 
   for (const url of finalUrls) {
     const card = makeCard(url);
@@ -6389,6 +7234,10 @@ function makeCard(url) {
       <div class="job-meta">
         <input class="job-title" type="text" placeholder="…" title="Click to rename — used as the prefix for any clips or stills ripped from this source.">
         <div class="job-sub">${esc(url)}</div>
+        <!-- Per-source open-in-browser buttons. Populated by
+             setSourceButtons(); one button per source URL the card
+             knows about (1 for direct pastes, 2+ for IMDB multi-sniff). -->
+        <div class="job-sources" style="display:none;"></div>
         <div class="ed-summary" style="display:none; margin-top:4px; font-size:11px; color:#000080;"></div>
         <div class="ed-strip"></div>
       </div>
@@ -6400,7 +7249,7 @@ function makeCard(url) {
         <input type="checkbox" class="subs" checked> subs
       </label>
       <button class="primary start">Rip It!</button>
-      <button class="edit" style="display:none;">Edit &amp; Save</button>
+      <button class="edit" style="display:none;">Edit</button>
       <!-- Contextual action buttons — visibility driven by CSS based on
            the card's dataset.state. Retry shows on errors, Reveal/Open
            after successful completion. -->
@@ -6431,6 +7280,43 @@ function makeCard(url) {
   let sniffManifestContent = "";
   let sniffPlaylists = null; // {masterUrl, masterContent, variants:[{height,bandwidth,url}], contents:{url->text}}
   let cardSniffId = "";
+  // Per-rip wall-clock anchor — set on the first download progress
+  // event, used to compute ETA in the status text. The progress
+  // BAR itself is purely segment-proportional (bar = downloaded /
+  // total) so it never gets ahead of the actual data; only the ETA
+  // string uses elapsed-time extrapolation, which the user can see
+  // is approximate. Earlier versions tried to drive the bar from
+  // a time estimator but that produced ugly edge cases (large
+  // segment counts → bar sprinted to 99% before real progress data
+  // arrived because the early "no data yet" estimate defaulted to
+  // ~30s, then the monotonic clamp pinned it).
+  let _ripStartedAt = 0;
+  function _ripReset() { _ripStartedAt = 0; }
+  // Multi-source sniff state. Single-source paths (legacy startSniff)
+  // populate sniffSources with one entry; the IMDB flow uses
+  // startMultiSniff which fills it with N entries (one per streaming
+  // front-end). activateSource(idx) copies the chosen source's data
+  // into the sniff* card vars above so the rip code stays unchanged.
+  let sniffSources = [];
+  let activeSourceIdx = -1;
+  function activateSource(idx) {
+    if (idx < 0 || idx >= sniffSources.length) return;
+    const s = sniffSources[idx];
+    if (!s || !s.data) return;
+    activeSourceIdx        = idx;
+    sniffTitle             = s.data.title || "";
+    sniffCookies           = s.data.cookiesFile || "";
+    sniffManifestContent   = s.data.manifestContent || "";
+    sniffPlaylists         = s.data.playlists || null;
+    sniffManifest          = s.data.manifestVariantUrl
+                            || (sniffPlaylists && sniffPlaylists.masterUrl)
+                            || "";
+    // Critical: the rip path reuses the WKWebView associated with this
+    // sniffId for segment fetches (referer + cookies inherit from
+    // whichever WebView opened that source). Swap when source changes
+    // or the rip will hit the wrong CDN context.
+    cardSniffId            = s.sniffId;
+  }
   // Editor session state — set after a successful /editor/start so we
   // can reuse the same sid on subsequent "Edit & Save" clicks (preserves
   // user's selections in the editor across re-opens).
@@ -6492,7 +7378,7 @@ function makeCard(url) {
       edSummary.textContent = "";
       edStrip.classList.remove("show");
       edStrip.innerHTML = "";
-      editBtn.textContent = "Edit & Save";
+      editBtn.textContent = "Edit";
       return;
     }
     const bits = [];
@@ -6501,7 +7387,7 @@ function makeCard(url) {
     if (k) bits.push(`${k} concat${k===1?"":"s"}`);
     edSummary.textContent = `Selections: ${bits.join(", ")}`;
     edSummary.style.display = "";
-    editBtn.textContent = "Edit Selections";
+    editBtn.textContent = "Edit";
     // Render thumbnail strip — one tile per clip/still/concat, in the
     // order the user added them. Each thumbnail is a JPEG dataURI
     // captured by the editor at save time. Click to re-open the editor.
@@ -6573,6 +7459,49 @@ function makeCard(url) {
       }
       _prevStatusKind = k;
     },
+    // Render a row of small "↗ host" buttons for every source URL
+    // associated with this card. Used by every populate path so
+    // direct pastes show one button (the URL the user gave us), and
+    // IMDB multi-sniff shows N (one per streaming front-end). Click
+    // POSTs to /open-url which routes to the user's default browser
+    // via the macOS `open` command.
+    setSourceButtons(urls) {
+      const box = el.querySelector(".job-sources");
+      if (!box) return;
+      box.innerHTML = "";
+      const seen = new Set();
+      const clean = (urls || []).filter(u => {
+        if (!u || typeof u !== "string") return false;
+        if (seen.has(u)) return false;
+        seen.add(u);
+        return true;
+      });
+      if (!clean.length) {
+        box.style.display = "none";
+        return;
+      }
+      for (const u of clean) {
+        const host = (() => {
+          try { return new URL(u).hostname.replace(/^www\./, ""); }
+          catch (e) { return u; }
+        })();
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "source-link-btn";
+        btn.title = "Open " + u;
+        btn.textContent = `↗ ${host}`;
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          fetch("/open-url", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({url: u}),
+          }).catch(() => {});
+        });
+        box.appendChild(btn);
+      }
+      box.style.display = "";
+    },
     getEditorItems() { return editorItems; },
     getCardSid() { return cardSid; },
     getSourceTitle() { return title.value || url; },
@@ -6583,6 +7512,7 @@ function makeCard(url) {
     // clicks Rip It! programmatically. Used by per-card Retry button
     // and the bulk "Retry all failed" action.
     retry() {
+      _ripReset();
       el.dataset.state = "ready";
       bar.classList.remove("err", "done");
       bar.style.width = "0%";
@@ -6600,7 +7530,7 @@ function makeCard(url) {
       if (!cardSid || !editorItems.length) return;
       el.dataset.state = "downloading";
       progWrap.classList.add("show");
-      bar.style.width = "0%"; bar.className = "bar";
+      bar.style.width = "0%"; bar.className = "bar"; _ripReset();
       const total = editorItems.length;
       let done = 0;
       for (const it of editorItems) {
@@ -6825,8 +7755,23 @@ function makeCard(url) {
       if (info.has_audio_only) add("audio", "Audio only");
       syncFormats();
       q.addEventListener("change", syncFormats);
+      // Multi-source sniff: each option carries data-source-idx telling
+      // us which sniffSources[] entry it came from. Switch the active
+      // source so the rip uses the right manifest / cookies / WebView
+      // when the user picks a variant from a different host.
+      q.addEventListener("change", () => {
+        const opt = q.selectedOptions[0];
+        if (!opt) return;
+        const raw = opt.dataset.sourceIdx;
+        if (raw == null) return;
+        const sIdx = parseInt(raw, 10);
+        if (Number.isFinite(sIdx) && sIdx !== activeSourceIdx) {
+          activateSource(sIdx);
+        }
+      });
       opts.classList.add("show");
       card.setStatus("");
+      card.setSourceButtons([url]);
       card.updateEditButton();
     },
     populateAsItem(item, sourceTitle, sourceUrl, idx, total) {
@@ -6899,21 +7844,175 @@ function makeCard(url) {
     },
     startSniff() {
       cardSniffId = "s" + Math.random().toString(36).slice(2, 10);
-      sniffMap.set(cardSniffId, card);
+      sniffMap.set(cardSniffId, {card: card, multi: false});
+      // Single-source path: one source, one result. Stored at index 0
+      // of sniffSources so the variant-change → activateSource path
+      // can no-op without special-casing.
+      sniffSources = [{
+        idx: 0, url: url, sniffId: cardSniffId,
+        ready: false, data: null,
+      }];
+      activeSourceIdx = 0;
       card.setStatus('<span class="spinner"></span> Sniffing in background…');
       window.webkit.messageHandlers.vdSniff.postMessage({id: cardSniffId, url});
     },
+    // Multi-source sniff: hit N streaming front-ends for the same
+    // underlying title (used by the IMDB flow). MUST run sequentially
+    // — Swift's sniffer keeps a single in-progress collection state
+    // (sniffID/sniffURL/sniffURLs/sniffPlaylists are class properties,
+    // not per-id), so two `vdSniff` calls in quick succession would
+    // clobber the first's capture buffer. We await each result before
+    // firing the next; per-sniff is usually 5-15s thanks to the
+    // adaptive grace timer landing early once a master playlist is
+    // captured. Once all sources have landed _finalizeMultiSniff
+    // merges every variant into a host-tagged quality dropdown.
+    async startMultiSniff(urls) {
+      if (!urls || !urls.length) return;
+      sniffSources = urls.map((u, i) => ({
+        idx: i, url: u, sniffId: "", ready: false, data: null,
+      }));
+      activeSourceIdx = -1;
+      for (let i = 0; i < urls.length; i++) {
+        const remaining = urls.length - i;
+        const host = (() => { try { return new URL(urls[i]).hostname.replace(/^www\./, ""); }
+                              catch(e) { return urls[i]; } })();
+        card.setStatus(`<span class="spinner"></span> Searching ${host} (${i+1}/${urls.length})…`);
+        const sid = "s" + Math.random().toString(36).slice(2, 10);
+        sniffSources[i].sniffId = sid;
+        // Promise that resolves with the sniff result data (or null
+        // on per-source timeout). We hand the resolver to the sniff
+        // map entry so __vdSniffResult can hand back the data.
+        const data = await new Promise((resolve) => {
+          let done = false;
+          sniffMap.set(sid, {
+            card,
+            multi: true,
+            srcIdx: i,
+            onResult: (d) => { if (done) return; done = true; resolve(d); },
+          });
+          window.webkit.messageHandlers.vdSniff.postMessage({id: sid, url: urls[i]});
+          // Belt-and-suspenders timeout — Swift's max-timer is 35s; we
+          // give a few extra seconds of slack before bailing on the
+          // source ourselves and moving to the next.
+          setTimeout(() => {
+            if (done) return;
+            done = true;
+            if (sniffMap.has(sid)) sniffMap.delete(sid);
+            resolve(null);
+          }, 40000);
+        });
+        sniffSources[i].data  = data;
+        sniffSources[i].ready = true;
+      }
+      card._finalizeMultiSniff();
+    },
+    _finalizeMultiSniff() {
+      // Filter to sources that actually returned a usable manifest.
+      // A source is "usable" if we captured either a master playlist
+      // or a single manifest body — anything else and the user can't
+      // actually pick a variant from it.
+      const ok = sniffSources.filter(s =>
+        s.data && (s.data.manifestContent ||
+                  (s.data.playlists && (s.data.playlists.masterContent || (s.data.playlists.variants || []).length))));
+      if (ok.length === 0) {
+        card.setStatus("No streams found on any source. Try the picker manually.", "err");
+        return;
+      }
+      // Activate the first usable source so card-state vars
+      // (sniffPlaylists, cookies, sniffId, etc.) are populated. The
+      // dropdown's `change` listener swaps them when the user picks
+      // a variant from a different source.
+      activateSource(ok[0].idx);
+
+      // Merged dropdown: every variant from every source, host-tagged
+      // so the user sees where each option comes from. Sorted by
+      // height descending then host so the highest-quality option
+      // sits at the top regardless of which source surfaced it.
+      const entries = [];
+      for (const src of ok) {
+        const host = (() => { try { return new URL(src.url).hostname.replace(/^www\./, ""); }
+                              catch (e) { return src.url; } })();
+        const playlists = src.data.playlists || {};
+        const variants  = playlists.variants || [];
+        const contents  = playlists.contents || {};
+        if (playlists.masterUrl && playlists.masterContent) {
+          entries.push({
+            value: "master",
+            srcIdx: src.idx,
+            host,
+            // "Best available" entries sort above any variant from
+            // the same source — synthetic "very-high" height for
+            // ordering. Backend hls_fetcher.py picks the highest
+            // variant from the master, so this label is accurate.
+            sortHeight: 1e9,
+            label: `Best available (${host})`,
+          });
+        }
+        for (const v of variants) {
+          const cached = contents[v.url] ? "" : " · live";
+          const label = v.height
+            ? `${v.height}p (${host})${cached}`
+            : `${(v.bandwidth/1000)|0} kbps (${host})${cached}`;
+          entries.push({
+            value: "v:" + v.url,
+            srcIdx: src.idx,
+            host,
+            sortHeight: v.height || 0,
+            label,
+          });
+        }
+      }
+      entries.sort((a, b) => (b.sortHeight - a.sortHeight) || a.host.localeCompare(b.host));
+
+      q.innerHTML = "";
+      for (const e of entries) {
+        const o = document.createElement("option");
+        o.value = e.value;
+        o.textContent = e.label;
+        o.dataset.sourceIdx = String(e.srcIdx);
+        q.appendChild(o);
+      }
+      sub.textContent = `Captured from ${ok.length} source${ok.length===1?"":"s"} · ${entries.length} option${entries.length===1?"":"s"}`;
+      cont.style.display = "";
+      opts.classList.add("show");
+      card.setStatus("");
+      // Show buttons for ALL candidate sources (not just the ones
+      // that returned variants) so the user can investigate any
+      // source that came back empty — sometimes the page loads in
+      // a real browser even if our sniffer didn't catch a stream.
+      card.setSourceButtons(sniffSources.map(s => s.url));
+      sniffMode = true;
+      card.updateEditButton();
+    },
     onHlsStatus(d) {
       el.dataset.state = "downloading";
-      card.setStatus(`<span class="spinner"></span> Browser-fetching · ${esc(d.status||"")}`);
+      // Encoding is the post-segment ffmpeg pass. We don't move the
+      // bar during encode — the bar represents segment download,
+      // which is already 100% by the time encoding starts. The text
+      // status carries encode progress + ETA.
+      if (d.phase === "encode") {
+        const txt = d.status || "Encoding…";
+        card.setStatus(`<span class="spinner"></span> ${esc(txt)}`);
+      } else {
+        card.setStatus(`<span class="spinner"></span> ${esc(d.status||"Browser-fetching…")}`);
+      }
       updateStatusBar();
     },
     onHlsProgress(d) {
       el.dataset.state = "downloading";
-      bar.style.width = (d.percent||0) + "%";
-      card.setStatus(`Downloading via browser · ${(d.percent||0).toFixed(1)}% (${d.idx}/${d.total} segments)`);
+      if (!_ripStartedAt) _ripStartedAt = Date.now();
+      const pct = (d.percent||0);
+      // Simple proportional bar — segment count is authoritative,
+      // no estimator games. Bar tracks downloaded / total exactly.
+      bar.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + "%";
+      // ETA computed from elapsed + progress (text only, so an
+      // imperfect estimate just shows up as a slightly-off number).
+      const elapsed = (Date.now() - _ripStartedAt) / 1000;
+      const eta = fmtETA(elapsed, pct / 100);
+      card.setStatus(`Downloading · ${pct.toFixed(0)}% (${d.idx}/${d.total} segments)${eta ? ` · ETA ${eta}` : ""}`);
     },
     onHlsDone(d) {
+      _ripReset();
       el.dataset.state = "done";
       bar.style.width = "100%"; bar.classList.add("done");
       savedFile = d.filename || "";
@@ -6951,6 +8050,7 @@ function makeCard(url) {
       updateStatusBar();
     },
     onHlsError(d) {
+      _ripReset();
       el.dataset.state = "error";
       bar.classList.add("err");
       card.setStatus("Failed:<br><pre style='margin:4px 0;white-space:pre-wrap;font-size:11px;color:inherit'>" + esc(d.error||"") + "</pre>", "err");
@@ -7004,7 +8104,7 @@ function makeCard(url) {
         const add = (val, label) => { const o=document.createElement("option"); o.value=val; o.textContent=label; q.appendChild(o); };
         // "Master" option = full master playlist — yt-dlp picks variant per -f
         if (sniffPlaylists && sniffPlaylists.masterUrl && sniffPlaylists.masterContent) {
-          add("master", "Master playlist (auto-pick best variant)");
+          add("master", "Best available");
         } else {
           add("best", "Best (auto)");
         }
@@ -7017,6 +8117,7 @@ function makeCard(url) {
         cont.style.display = "";
         opts.classList.add("show");
         card.setStatus("");
+        card.setSourceButtons([url]);
         card.updateEditButton();
         return;
       }
@@ -7047,6 +8148,7 @@ function makeCard(url) {
             q.addEventListener("change", syncCont); syncCont();
             opts.classList.add("show");
             card.setStatus("");
+            card.setSourceButtons([url]);
             return;
           }
         } catch(e) { /* fall through to candidate list */ }
@@ -7065,6 +8167,7 @@ function makeCard(url) {
       cont.style.display = "";
       opts.classList.add("show");
       card.setStatus(`Couldn't read variants — pick a stream manually.`);
+      card.setSourceButtons([url]);
     },
   };
 
@@ -7094,7 +8197,7 @@ function makeCard(url) {
       startBtn.disabled = true;
       el.dataset.state = "downloading";
       progWrap.classList.add("show");
-      bar.style.width = "0%"; bar.className = "bar";
+      bar.style.width = "0%"; bar.className = "bar"; _ripReset();
       updateStatusBar();
       try {
         const heightSel = q.value;
@@ -7262,16 +8365,83 @@ function makeCard(url) {
     }
     serverId = j.id;
     evt = new EventSource("/events/" + serverId);
+    // Recognize yt-dlp postprocessor markers and rewrite to a friendly
+    // label. Without this we show the raw log line, which is usually
+    // the [Merger]/[VideoConvertor] header followed by a long file
+    // path that got slice(-110)'d into something like "…ng formats
+    // into '/Users/...'" — front of the message lost. Mapping known
+    // markers to clean status text fixes that.
+    function _ytdlpPrettyLine(raw) {
+      if (!raw) return "";
+      const s = String(raw).trim();
+      // [download] lines carry size + speed + ETA — strip just the
+      // marker prefix and keep the data. Looks like:
+      //   "[download]  7.1% of  238.41MiB at  3.45MiB/s ETA 03:42"
+      // → "7.1% of 238.41MiB at 3.45MiB/s ETA 03:42"
+      if (/^\[download\]/i.test(s)) {
+        return s.replace(/^\[download\]\s*/i, "").replace(/\s+/g, " ").trim();
+      }
+      // Postprocessor markers — replace with a clean friendly label
+      // since the rest of the line is usually the input/output path,
+      // which is just noise.
+      const map = [
+        [/^\[Merger\]/i,           "Merging audio + video streams…"],
+        [/^\[VideoConvertor\]/i,   "Re-encoding video…"],
+        [/^\[VideoRemuxer\]/i,     "Remuxing container…"],
+        [/^\[ExtractAudio\]/i,     "Extracting audio…"],
+        [/^\[Fixup\w+\]/i,         "Fixing up file…"],
+        [/^\[EmbedSubtitle\]/i,    "Embedding subtitles…"],
+        [/^\[Metadata\]/i,         "Writing metadata…"],
+        [/^\[ThumbnailsConvertor\]/i, "Processing thumbnail…"],
+      ];
+      for (const [re, label] of map) {
+        if (re.test(s)) return label;
+      }
+      // Fallback: keep the FRONT of the line (which usually identifies
+      // the action) instead of slicing from the end and losing it.
+      return s.length > 100 ? s.slice(0, 100) + "…" : s;
+    }
+    // Postprocessor phases (Merger / VideoConvertor / our own
+    // _ensure_*_in_place) emit a single label line then go silent
+    // while ffmpeg crunches. Tick an elapsed-time counter every
+    // second so the user can see the rip is still alive — a frozen
+    // "Merging…" string for 5 minutes feels broken even when it
+    // isn't. _ppLabel is the most recent activity label; _ppStart
+    // anchors the counter; the interval is cleared on the next
+    // progress / activity / done / error event.
+    let _ppLabel = "";
+    let _ppStart = 0;
+    let _ppTimer = null;
+    const _ppStop = () => {
+      if (_ppTimer) { clearInterval(_ppTimer); _ppTimer = null; }
+      _ppLabel = ""; _ppStart = 0;
+    };
+    const _fmtElapsed = (ms) => {
+      const s = Math.max(0, Math.floor(ms / 1000));
+      if (s < 60) return s + "s";
+      return Math.floor(s/60) + ":" + String(s%60).padStart(2, "0");
+    };
     evt.onmessage = ev => {
       const d = JSON.parse(ev.data);
       if (d.type === "progress") {
+        _ppStop();
         bar.style.width = d.percent + "%";
-        const tail = d.line ? esc(d.line.slice(-90)) : "";
+        const tail = d.line ? esc(_ytdlpPrettyLine(d.line)) : "";
         card.setStatus(`Downloading · ${d.percent.toFixed(1)}%<br><span style="color:#636366;font-size:11px">${tail}</span>`);
       } else if (d.type === "activity") {
-        const tail = esc((d.line||"").slice(-110));
-        card.setStatus(`<span class="spinner"></span> ${tail}`);
+        const pretty = esc(_ytdlpPrettyLine(d.line));
+        // Fresh post-process label → restart the elapsed-time tick.
+        _ppLabel = pretty;
+        _ppStart = Date.now();
+        if (!_ppTimer) {
+          _ppTimer = setInterval(() => {
+            const elapsed = Date.now() - _ppStart;
+            card.setStatus(`<span class="spinner"></span> ${_ppLabel} · ${_fmtElapsed(elapsed)}`);
+          }, 1000);
+        }
+        card.setStatus(`<span class="spinner"></span> ${pretty}`);
       } else if (d.type === "done") {
+        _ppStop();
         el.dataset.state = "done";
         bar.style.width = "100%"; bar.classList.add("done");
         savedFile = d.filename || "";
@@ -7287,11 +8457,25 @@ function makeCard(url) {
         evt.close();
         updateStatusBar();
       } else if (d.type === "error") {
+        _ppStop();
         el.dataset.state = "error";
         bar.classList.add("err");
         card.setStatus("Failed:<br><pre style='margin:4px 0;white-space:pre-wrap;font-size:11px;color:inherit'>" + esc(d.error||"") + "</pre>", "err");
         startBtn.disabled = false; evt.close();
         updateStatusBar();
+      } else if (d.type === "status") {
+        // Backend can push a free-form status (e.g. "Normalizing
+        // video codec…" from our post-pass). Treat it like an
+        // activity event — restart the elapsed-time tick.
+        _ppLabel = esc(d.status||"");
+        _ppStart = Date.now();
+        if (!_ppTimer) {
+          _ppTimer = setInterval(() => {
+            const elapsed = Date.now() - _ppStart;
+            card.setStatus(`<span class="spinner"></span> ${_ppLabel} · ${_fmtElapsed(elapsed)}`);
+          }, 1000);
+        }
+        card.setStatus(`<span class="spinner"></span> ${_ppLabel}`);
       }
     };
     evt.onerror = () => { /* ignore — we handle terminal events explicitly */ };
@@ -8672,7 +9856,7 @@ EDITOR_HTML = r"""<!doctype html>
       <button id="btn-back" title="Previous frame (←)">&laquo; 1f</button>
       <button id="btn-fwd" title="Next frame (→)">1f &raquo;</button>
       <span class="mono" id="time-display">00:00.000 / 00:00.000</span>
-      <label class="speed-lbl" title="Playback speed (, slower · . faster)">
+      <label class="speed-lbl" title="Playback speed">
         Speed
         <select id="speed">
           <option value="0.25">0.25×</option>
@@ -8781,7 +9965,7 @@ EDITOR_HTML = r"""<!doctype html>
   <div class="panel">
     <div class="row" style="margin-bottom:6px;">
       <strong>Items</strong>
-      <span class="small">— click a row to load · checkboxes for batch ops · ↑/↓ to reorder · ⌫ remove · ? help</span>
+      <span class="small">— click a row to load · checkboxes for batch ops · ↑/↓ navigate · ⌘↑/↓ reorder · ⌫ remove · ? help</span>
       <span class="grow"></span>
       <button id="btn-concat-selected" style="display:none" title="Stitch the selected clips into a single video file">Concat clips (0)</button>
       <button id="btn-remove-selected" style="display:none">Remove (0)</button>
@@ -8823,12 +10007,12 @@ EDITOR_HTML = r"""<!doctype html>
     <table>
       <tr class="sh-section"><td colspan="2">Playback</td></tr>
       <tr><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
-      <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Step ±1 frame</td></tr>
-      <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>Seek ±1 second</td></tr>
+      <tr><td><kbd>,</kbd> / <kbd>.</kbd></td><td>Step ±1 frame</td></tr>
+      <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Seek ±1 second</td></tr>
+      <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>Seek ±10 seconds</td></tr>
       <tr><td><kbd>L</kbd></td><td>Toggle loop between marks</td></tr>
       <tr><td><kbd>P</kbd></td><td>Preview the marked clip once</td></tr>
       <tr><td><kbd>M</kbd></td><td>Mute / unmute</td></tr>
-      <tr><td><kbd>,</kbd> / <kbd>.</kbd></td><td>Slower / faster playback (0.25× → 2×)</td></tr>
       <tr><td><kbd>Cmd</kbd>+<kbd>=</kbd> / <kbd>-</kbd></td><td>Zoom timeline in / out</td></tr>
       <tr><td><kbd>Cmd</kbd>+<kbd>0</kbd></td><td>Fit timeline to full duration</td></tr>
       <tr><td colspan="2" class="small">Or hold <kbd>Cmd</kbd> and scroll over the timeline. Plain scroll pans when zoomed in.</td></tr>
@@ -8848,7 +10032,8 @@ EDITOR_HTML = r"""<!doctype html>
 
       <tr class="sh-section"><td colspan="2">Items</td></tr>
       <tr><td><kbd>⌫</kbd> / <kbd>Delete</kbd></td><td>Remove selected items</td></tr>
-      <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Move loaded item up / down in the list</td></tr>
+      <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Load previous / next item in the list</td></tr>
+      <tr><td><kbd>Cmd</kbd>+<kbd>↑</kbd> / <kbd>Cmd</kbd>+<kbd>↓</kbd></td><td>Move loaded item up / down in the list</td></tr>
       <tr><td><kbd>Cmd</kbd>+<kbd>A</kbd></td><td>Select all items</td></tr>
       <tr><td><kbd>Cmd</kbd>+<kbd>Z</kbd></td><td>Undo last change</td></tr>
       <tr><td><kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>Redo</td></tr>
@@ -8899,12 +10084,19 @@ let _cachePollHandle = null;
 
 function fmtMB(b) { return (b / (1024 * 1024)).toFixed(0) + "MB"; }
 
+// Wall-clock anchor for the cache prefetch — wakes on the first
+// non-zero progress update and feeds the ETA computation. Reset on
+// pill state transitions (ready/error) so the next session starts
+// fresh.
+let _cacheStartedAt = 0;
+
 function updateCachePill(ready, bytes, total, errored) {
   const pill = document.getElementById("cache-pill");
   const text = document.getElementById("cache-pill-text");
   const bar  = document.getElementById("cache-pill-bar");
   if (!pill || !text) return;
   if (errored) {
+    _cacheStartedAt = 0;
     pill.dataset.state = "error";
     text.textContent = "Cache failed — using live stream";
     if (bar) bar.style.width = "0%";
@@ -8912,6 +10104,7 @@ function updateCachePill(ready, bytes, total, errored) {
     return;
   }
   if (ready) {
+    _cacheStartedAt = 0;
     pill.dataset.state = "ready";
     text.textContent = "Local cache ready";
     if (bar) bar.style.width = "100%";
@@ -8920,9 +10113,12 @@ function updateCachePill(ready, bytes, total, errored) {
     return;
   }
   pill.dataset.state = "loading";
+  if (!_cacheStartedAt && bytes > 0) _cacheStartedAt = Date.now();
   if (total > 0) {
     const pct = Math.min(100, Math.max(0, (bytes / total) * 100));
-    text.textContent = `Caching… ${pct.toFixed(0)}% (${fmtMB(bytes)} / ${fmtMB(total)})`;
+    const elapsed = _cacheStartedAt ? (Date.now() - _cacheStartedAt) / 1000 : 0;
+    const eta = fmtETA(elapsed, pct / 100);
+    text.textContent = `Caching… ${pct.toFixed(0)}% (${fmtMB(bytes)} / ${fmtMB(total)})${eta ? ` · ETA ${eta}` : ""}`;
     if (bar) bar.style.width = pct.toFixed(1) + "%";
   } else if (bytes > 0) {
     // No content-length up front (chunked / HLS) — show MB downloaded
@@ -10844,10 +12040,19 @@ document.addEventListener("keydown", (e) => {
     // Drop a marker at the playhead — labelled bookmark for navigation.
     e.preventDefault();
     addMarker(player.currentTime || 0);
-  } else if (e.key === ",") {
-    e.preventDefault(); nudgeSpeed(-1);
-  } else if (e.key === ".") {
-    e.preventDefault(); nudgeSpeed(+1);
+  } else if (e.key === "," || e.key === "<") {
+    // Frame-step backward. Frame-step is an explicit user seek —
+    // suppress loop wrap so the user can step PAST the out point
+    // without getting bounced back. Used to be playback-speed
+    // slower; speed now lives only in the dropdown control.
+    e.preventDefault();
+    markUserSeek();
+    player.currentTime = Math.max(0, player.currentTime - 1/30);
+  } else if (e.key === "." || e.key === ">") {
+    e.preventDefault();
+    markUserSeek();
+    player.currentTime = Math.min(effectiveDuration() - 0.001,
+                                  player.currentTime + 1/30);
   } else if (e.key === "Backspace" || e.key === "Delete") {
     if (selectedIds.size || activeItemId != null) {
       e.preventDefault();
@@ -10868,28 +12073,58 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     playBtn.click();
   } else if (e.key === "ArrowLeft") {
+    // Plain ← seeks 1s; Shift+← seeks 10s.
     e.preventDefault();
-    // Frame-step is an explicit user seek — suppress loop wrap so the
-    // user can step PAST the out point without getting bounced back.
     markUserSeek();
-    player.currentTime = Math.max(0, player.currentTime - (e.shiftKey ? 1 : 1/30));
+    player.currentTime = Math.max(0, player.currentTime - (e.shiftKey ? 10 : 1));
   } else if (e.key === "ArrowRight") {
     e.preventDefault();
     markUserSeek();
     player.currentTime = Math.min(effectiveDuration() - 0.001,
-                                  player.currentTime + (e.shiftKey ? 1 : 1/30));
+                                  player.currentTime + (e.shiftKey ? 10 : 1));
   } else if (e.key === "ArrowUp") {
-    // Move the loaded item up one slot in the items list. Plain ↑ —
-    // matches the per-row arrow buttons. No-op when nothing is loaded.
-    if (activeItemId != null) {
-      e.preventDefault();
-      moveItemByOne(activeItemId, -1);
+    // Cmd/Ctrl+↑ → reorder loaded item up. Plain ↑ → navigate to
+    // previous item in the list (load it). The reorder behavior used
+    // to live on plain ↑ but it conflicted with the more natural
+    // expectation of arrow keys as list navigation. Now matches the
+    // mac standard: arrows move selection, modifier+arrow rearranges.
+    if (e.metaKey || e.ctrlKey) {
+      if (activeItemId != null) {
+        e.preventDefault();
+        moveItemByOne(activeItemId, -1);
+      }
+      return;
     }
+    if (items.length === 0) return;
+    e.preventDefault();
+    const curIdx = activeItemId != null
+      ? items.findIndex(x => x.id === activeItemId) : -1;
+    if (curIdx === -1) {
+      // Nothing loaded → load the last item so ↑ feels like "select
+      // the bottom of the list" (mirrors a standard list navigator).
+      loadItem(items[items.length - 1]);
+    } else if (curIdx > 0) {
+      loadItem(items[curIdx - 1]);
+    }
+    // else: at top of list, no-op
   } else if (e.key === "ArrowDown") {
-    if (activeItemId != null) {
-      e.preventDefault();
-      moveItemByOne(activeItemId, +1);
+    if (e.metaKey || e.ctrlKey) {
+      if (activeItemId != null) {
+        e.preventDefault();
+        moveItemByOne(activeItemId, +1);
+      }
+      return;
     }
+    if (items.length === 0) return;
+    e.preventDefault();
+    const curIdx = activeItemId != null
+      ? items.findIndex(x => x.id === activeItemId) : -1;
+    if (curIdx === -1) {
+      loadItem(items[0]);
+    } else if (curIdx < items.length - 1) {
+      loadItem(items[curIdx + 1]);
+    }
+    // else: at bottom of list, no-op
   }
 });
 

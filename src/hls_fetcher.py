@@ -124,20 +124,39 @@ def fetch(session, url, page_url, cookies, *, attempts=4):
     ck = cookies_for(url, cookies)
     # Try Safari first — same TLS fingerprint as the WKWebView that
     # established the player session, so CDNs treat us identically. If
-    # that's somehow rejected (rare), fall back to Chrome variants.
+    # that's somehow rejected (rare), fall back to Chrome variants on
+    # later attempts.
     profiles = ["safari17_0", "safari18_0", "chrome131", "chrome120"]
     last_err = None
+    last_resp = None
     for i in range(attempts):
         prof = profiles[min(i, len(profiles) - 1)]
         try:
-            return session.get(
+            r = session.get(
                 url, headers=headers, cookies=ck,
                 impersonate=prof, timeout=60,
             )
+            # Success → return immediately.
+            if r.status_code in (200, 206):
+                return r
+            last_resp = r
+            # Hard 4xx → no point retrying; these don't change with
+            # TLS profile rotation. (404 = gone, 400 = malformed.)
+            if r.status_code in (400, 404, 410):
+                return r
+            # 5xx, 401, 403, 429, 451 → could be Cloudflare rate-limit
+            # or transient worker error. Worth retrying with a fresh
+            # TLS profile + a backoff delay; a meaningful chunk of
+            # these go through on the second try.
         except Exception as e:
             last_err = e
-            time.sleep(min(8.0, 0.5 * (2 ** i)) + random.uniform(0, 0.3))
-    raise last_err
+        time.sleep(min(4.0, 0.5 * (2 ** i)) + random.uniform(0, 0.2))
+    # Out of attempts. Return the last non-2xx response if we got one
+    # (caller's diag prints useful headers); otherwise raise the
+    # exception we collected.
+    if last_resp is not None:
+        return last_resp
+    raise last_err if last_err else RuntimeError("fetch failed (unknown)")
 
 
 def diag_for(url, page_url, origin, cookies, response):
@@ -175,6 +194,23 @@ def main():
         base = manifest_url
         p = urlparse(page_url)
         origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+
+        # If the caller didn't pre-cache the manifest body (e.g. user
+        # picked a "live fetch" variant whose playlist wasn't captured
+        # during sniff), fetch it now via curl_cffi with the player's
+        # cookies/Cloudflare clearance still warm.
+        if not text:
+            emit({"type": "status", "msg": "fetching playlist"})
+            try:
+                r = fetch(session, manifest_url, page_url, cookies)
+            except Exception as e:
+                emit({"type": "error", "error": f"playlist fetch failed: {e}"})
+                return
+            if r.status_code != 200:
+                emit({"type": "error",
+                      "error": f"playlist HTTP {r.status_code}" + diag_for(manifest_url, page_url, origin, cookies, r)})
+                return
+            text = r.text
 
         if "#EXT-X-STREAM-INF" in text:
             variants = parse_master(text, manifest_url)
