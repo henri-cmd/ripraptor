@@ -707,13 +707,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let data = h.availableData
             if data.isEmpty { return }
             guard let chunk = String(data: data, encoding: .utf8) else { return }
-            DispatchQueue.main.async { self?.consumeStartup(chunk) }
+            DispatchQueue.main.async {
+                self?.startupBuffer += chunk
+                self?.consumeStartup(chunk)
+            }
         }
 
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
-                if self?.loadedURL == nil {
-                    self?.failStart("Server exited (status \(p.terminationStatus))")
+                guard let self = self else { return }
+                if self.loadedURL == nil {
+                    // Show the user the actual reason Python died — last
+                    // 8 non-empty lines of stdout/stderr, which usually
+                    // contains the traceback or syntax error. Saves the
+                    // user (and us) from blind "status 1" debugging.
+                    let tail = self.startupBuffer
+                        .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                        .suffix(8)
+                        .joined(separator: "\n")
+                    let detail = tail.isEmpty
+                        ? "Server exited (status \(p.terminationStatus))"
+                        : "Server exited (status \(p.terminationStatus)):\n\n\(tail)"
+                    self.failStart(detail)
                 }
             }
         }
@@ -727,8 +744,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func consumeStartup(_ chunk: String) {
+        // Buffer is appended in the readabilityHandler before this is
+        // called so the terminationHandler can dump it on failure. We
+        // still keep the WebView load on first URL match.
         if loadedURL != nil { return }
-        startupBuffer += chunk
         if let range = startupBuffer.range(of: #"http://127\.0\.0\.1:\d+"#, options: .regularExpression) {
             let urlStr = String(startupBuffer[range])
             if let url = URL(string: urlStr) { load(url) }
@@ -743,15 +762,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func failStart(_ msg: String) {
-        if let v = window.contentView?.viewWithTag(999) as? NSTextField {
+        // Multi-line errors (e.g. Python tracebacks captured from stderr)
+        // can't fit in the single-line placeholder text field. Show an
+        // NSAlert so the user actually sees the diagnostic.
+        let multiline = msg.contains("\n")
+        if !multiline, let v = window.contentView?.viewWithTag(999) as? NSTextField {
             v.stringValue = "Couldn't start: \(msg)"
             v.textColor = .systemRed
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "Could not start Rip Raptor"
-            alert.informativeText = msg
-            alert.runModal()
+            return
         }
+        // Show single-line summary in the placeholder too, so the user
+        // can see SOMETHING even if they dismissed the alert.
+        if let v = window.contentView?.viewWithTag(999) as? NSTextField {
+            v.stringValue = "Couldn't start (see dialog)"
+            v.textColor = .systemRed
+        }
+        let alert = NSAlert()
+        alert.messageText = "Could not start Rip Raptor"
+        alert.informativeText = msg
+        alert.runModal()
     }
 
     func firstExisting(_ paths: [String]) -> String? {

@@ -16,6 +16,10 @@ Emits one JSON object per line:
   {"type":"done"}
   {"type":"error","error":"..."}
 """
+# Defer annotation evaluation so PEP 604 unions (`X | None`) parse on
+# Python 3.9 (Apple's stock CLT Python on macOS 12-15).
+from __future__ import annotations
+
 import concurrent.futures
 import json
 import random

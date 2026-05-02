@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Video Downloader micro-app: local web UI wrapping yt-dlp."""
 
+# PEP 563: defer annotation evaluation. Without this, the PEP 604
+# union syntax (`dict | None`) used in type hints throughout this
+# file blows up at function-definition time on Python 3.9 (Apple's
+# stock /usr/bin/python3 on macOS 12-15 without Homebrew). With it,
+# annotations become strings and never get evaluated at runtime, so
+# the file imports cleanly on any Python 3.7+.
+from __future__ import annotations
+
 import http.server
 import json
 import os
@@ -26,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
