@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}

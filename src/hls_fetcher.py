@@ -115,22 +115,25 @@ def _thread_session():
     return s
 
 
-def fetch(session, url, page_url, cookies, *, attempts=4):
+def fetch(session, url, page_url, cookies, *, attempts=2):
     # NB: this CDN's Cloudflare config 403s any request that bears a
     # Referer (likely an anti-hotlink rule). Real Safari's <video>
     # element omits Referer for cross-origin media fetches by default.
     # We do the same. Origin/Sec-Fetch-* only matter for browser CORS
     # preflight which curl_cffi doesn't do, so we skip them too.
+    #
+    # attempts=2 is a deliberate trade-off: one retry on transient 5xx
+    # is enough to recover most flapping requests, but a third+ try
+    # rarely helps and the cumulative backoff is what makes a flaky
+    # CDN feel like a slow CDN. With a 1s max backoff, worst-case
+    # retry cost is ~1.2s per failing segment — small enough that
+    # 10-20% segment-failure rates don't tank overall throughput.
     headers = {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
     ck = cookies_for(url, cookies)
-    # Try Safari first — same TLS fingerprint as the WKWebView that
-    # established the player session, so CDNs treat us identically. If
-    # that's somehow rejected (rare), fall back to Chrome variants on
-    # later attempts.
-    profiles = ["safari17_0", "safari18_0", "chrome131", "chrome120"]
+    profiles = ["safari17_0", "chrome131"]
     last_err = None
     last_resp = None
     for i in range(attempts):
@@ -140,24 +143,19 @@ def fetch(session, url, page_url, cookies, *, attempts=4):
                 url, headers=headers, cookies=ck,
                 impersonate=prof, timeout=60,
             )
-            # Success → return immediately.
             if r.status_code in (200, 206):
                 return r
             last_resp = r
-            # Hard 4xx → no point retrying; these don't change with
-            # TLS profile rotation. (404 = gone, 400 = malformed.)
+            # Hard 4xx — don't retry; same response on second try.
             if r.status_code in (400, 404, 410):
                 return r
-            # 5xx, 401, 403, 429, 451 → could be Cloudflare rate-limit
-            # or transient worker error. Worth retrying with a fresh
-            # TLS profile + a backoff delay; a meaningful chunk of
-            # these go through on the second try.
+            # 5xx, 401/403/429/451 — one retry with a fresh TLS
+            # profile, then we surface the failure. Cloudflare-flagged
+            # IPs don't recover on attempt 4 if they didn't on attempt
+            # 2, so further retries just waste wall time.
         except Exception as e:
             last_err = e
-        time.sleep(min(4.0, 0.5 * (2 ** i)) + random.uniform(0, 0.2))
-    # Out of attempts. Return the last non-2xx response if we got one
-    # (caller's diag prints useful headers); otherwise raise the
-    # exception we collected.
+        time.sleep(min(1.0, 0.5 * (2 ** i)) + random.uniform(0, 0.15))
     if last_resp is not None:
         return last_resp
     raise last_err if last_err else RuntimeError("fetch failed (unknown)")
