@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -73,46 +73,115 @@ def _rewrite_url(url: str) -> str:
     return url
 
 
-def _ensure_curl_cffi_runtime():
-    """Re-exec ourselves under the pipx yt-dlp venv's Python so that the
-    editor's segment proxy can call curl_cffi inline (impersonating Chrome)
-    without per-request subprocess overhead. System Python lacks curl_cffi.
+# Per-user vendor directory for runtime-installed Python deps
+# (curl_cffi). Lives in Application Support so it persists across
+# launches — the install runs once on first start. Exposed as a
+# module-level constant so the /hls-fetch subprocess launcher can
+# reuse it via PYTHONPATH.
+_CURL_CFFI_VENDOR = (Path.home() / "Library" / "Application Support" /
+                     "Rip Raptor" / "python-deps")
 
-    No-op once we're already running there, so this is idempotent across
-    re-execs.
+
+def _ensure_curl_cffi_runtime():
+    """Make `curl_cffi` importable for the rest of this process. Tried
+    in order:
+
+      1. Direct import — already installed in the running Python.
+      2. Pipx venv re-exec — the dev path. If the user has
+         `pipx install yt-dlp` set up, curl_cffi is already injected
+         into that venv; we re-exec there so the import is free.
+      3. Vendor-dir bootstrap — for users who installed the dmg but
+         have no pipx and no curl_cffi anywhere. We pip-install it
+         into Application Support/Rip Raptor/python-deps and add
+         that dir to sys.path. ~10-30s on first launch, free on
+         every subsequent launch.
+
+    Falls through silently if all three fail; curl_cffi-dependent
+    features (HLS impersonation, editor segment proxy) will fail at
+    use time but the app still launches.
     """
+    # Path 1: direct import.
     try:
         import curl_cffi  # noqa: F401
         return
     except Exception:
         pass
+
+    # Path 2: pipx venv re-exec (dev convenience).
     venv_dir = str(Path.home() / ".local/pipx/venvs/yt-dlp")
-    # NB: comparing realpath(executable) is wrong here. The pipx venv's
-    # python is a symlink chain that resolves to the global homebrew
-    # python — but the *site-packages* differ. We have to check sys.prefix
-    # instead; if we're already in the venv but curl_cffi still can't import,
-    # something else is broken and looping won't help.
     try:
         already_in_venv = os.path.realpath(sys.prefix).startswith(
             os.path.realpath(venv_dir))
     except Exception:
         already_in_venv = False
-    if already_in_venv:
+    if not already_in_venv:
+        for cand in (
+            str(Path(venv_dir) / "bin/python"),
+            str(Path(venv_dir) / "bin/python3"),
+        ):
+            if not Path(cand).exists():
+                continue
+            try:
+                # Pass -u so stdout stays unbuffered after re-exec — Swift
+                # parses our startup banner from stdout and gates the UI on it.
+                os.execv(cand, [cand, "-u", os.path.abspath(__file__)] + sys.argv[1:])
+            except Exception:
+                continue
+
+    # Path 3: vendor dir bootstrap. Persistent install in Application
+    # Support so subsequent launches skip the pip step.
+    try:
+        _CURL_CFFI_VENDOR.mkdir(parents=True, exist_ok=True)
+    except Exception:
         return
-    for cand in (
-        str(Path(venv_dir) / "bin/python"),
-        str(Path(venv_dir) / "bin/python3"),
-    ):
-        if not Path(cand).exists():
-            continue
+    if str(_CURL_CFFI_VENDOR) not in sys.path:
+        sys.path.insert(0, str(_CURL_CFFI_VENDOR))
+    try:
+        import curl_cffi  # noqa: F401
+        return  # already installed from a prior launch
+    except Exception:
+        pass
+
+    # Need to install. Print BEFORE we run pip so users on the very
+    # first launch see "Installing dependencies..." instead of an
+    # apparent freeze. The Swift host watches stdout for our HTTP
+    # banner — extra "[setup]" lines ahead of it don't trip anything.
+    try:
+        sys.stdout.write("[setup] Installing curl_cffi (one-time, ~10-30s)…\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    pip_cmd = [sys.executable, "-m", "pip", "install",
+               "--target", str(_CURL_CFFI_VENDOR),
+               "--quiet", "--upgrade",
+               "curl_cffi"]
+    try:
+        result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=240)
+    except Exception as e:
         try:
-            # Pass -u so stdout stays unbuffered after re-exec — Swift
-            # parses our startup banner from stdout and gates the UI on it.
-            os.execv(cand, [cand, "-u", os.path.abspath(__file__)] + sys.argv[1:])
-        except Exception:
-            continue
-    # Couldn't re-exec — editor proxy will fail loudly when it tries to use
-    # curl_cffi, but the rest of the app (yt-dlp, helper subprocess) still works.
+            sys.stdout.write(f"[setup] curl_cffi install error: {e}\n")
+            sys.stdout.flush()
+        except Exception: pass
+        return
+
+    if result.returncode != 0:
+        tail = ((result.stderr or result.stdout or "")[-400:]).strip()
+        try:
+            sys.stdout.write(f"[setup] curl_cffi install failed (rc={result.returncode}): {tail}\n")
+            sys.stdout.flush()
+        except Exception: pass
+        return
+
+    # Re-attempt import now that the wheel is on disk + on path.
+    try:
+        import curl_cffi  # noqa: F401
+        sys.stdout.write("[setup] curl_cffi installed.\n"); sys.stdout.flush()
+    except Exception as e:
+        try:
+            sys.stdout.write(f"[setup] curl_cffi still not importable: {e}\n")
+            sys.stdout.flush()
+        except Exception: pass
 
 
 _ensure_curl_cffi_runtime()
@@ -399,22 +468,42 @@ def _err_payload(msg: str) -> dict:
 
 
 def _pick_python_with_curl_cffi() -> str:
-    """Find a Python interpreter that can `import curl_cffi`. The pipx
-    venv where we injected curl_cffi is the canonical home. System Python
-    almost certainly doesn't have it."""
+    """Find a Python interpreter that can `import curl_cffi`. Order:
+
+      1. The currently-running Python (sys.executable). After
+         _ensure_curl_cffi_runtime ran at module-load time, curl_cffi
+         is already importable here for users with pipx OR users
+         who got the auto-installed vendor dir.
+      2. The pipx venv (dev path).
+
+    Returns "" if no Python with curl_cffi can be found — callers fall
+    back to stdlib paths or surface a missing-helper error.
+    """
+    # Test current Python first. We have to run a subprocess (rather
+    # than just importing here) because the same call also probes for
+    # other Python installs below.
     candidates = [
+        sys.executable,
         str(Path.home() / ".local/pipx/venvs/yt-dlp/bin/python"),
         str(Path.home() / ".local/pipx/venvs/yt-dlp/bin/python3"),
     ]
+    # Probe with PYTHONPATH including our vendor dir, since the
+    # auto-installed curl_cffi lives there for users without pipx.
+    env = dict(os.environ)
+    extra = str(_CURL_CFFI_VENDOR)
+    if extra:
+        prev = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = extra + (os.pathsep + prev if prev else "")
     for c in candidates:
-        if Path(c).exists():
-            try:
-                r = subprocess.run([c, "-c", "import curl_cffi"],
-                                   capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    return c
-            except Exception:
-                continue
+        if not c or not Path(c).exists():
+            continue
+        try:
+            r = subprocess.run([c, "-c", "import curl_cffi"],
+                               capture_output=True, timeout=5, env=env)
+            if r.returncode == 0:
+                return c
+        except Exception:
+            continue
     return ""
 
 
@@ -517,6 +606,45 @@ def _cookies_for_host(url: str, cookies: list) -> dict:
 
 _proxy_session = None
 _proxy_session_lock = threading.Lock()
+
+
+def _simple_get(url: str, *, timeout: float = 10.0,
+                headers: dict | None = None) -> tuple[int, str]:
+    """Plain stdlib urllib GET. Returns (status, body_text).
+
+    Used for endpoints that don't need TLS impersonation — IMDB's
+    suggest API, cinemeta. These are public JSON APIs without
+    anti-bot fingerprinting, so the heavyweight curl_cffi machinery
+    isn't needed and shouldn't gate them. Critically, IMDB search
+    keeps working on user installs where curl_cffi isn't present in
+    the system Python (Apple's stock 3.9 most notably).
+
+    Returns (status, body) on any HTTP response — including 4xx/5xx.
+    Raises RuntimeError only on transport failures (DNS, TLS, etc.).
+    """
+    import urllib.request
+    import urllib.error
+    h = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.0 Safari/605.1.15"),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return e.code, body
+    except Exception as e:
+        raise RuntimeError(f"http error: {e}") from e
 
 
 def _proxy_get(url: str, cookies: list, *, range_header: str = "", stream: bool = True):
@@ -795,9 +923,15 @@ def _ensure_cached_source(sess: dict) -> str:
                 }).encode()
                 if not CURL_PYTHON or not Path(HLS_FETCHER).exists():
                     raise RuntimeError("hls_fetcher unavailable")
+                # Pass PYTHONPATH=vendor so the subprocess can find
+                # our auto-installed curl_cffi when the system Python
+                # doesn't already have it (the standard user case).
+                _env = dict(os.environ)
+                _env["PYTHONPATH"] = str(_CURL_CFFI_VENDOR) + (
+                    os.pathsep + _env["PYTHONPATH"] if _env.get("PYTHONPATH") else "")
                 res = subprocess.run(
                     [CURL_PYTHON, "-u", HLS_FETCHER],
-                    input=spec, capture_output=True, timeout=3600,
+                    input=spec, capture_output=True, timeout=3600, env=_env,
                 )
                 if not tmp_ts.exists() or tmp_ts.stat().st_size == 0:
                     raise RuntimeError("hls fetch produced empty output")
@@ -3118,13 +3252,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid id"})
             api_url = f"https://v3.sg.media-imdb.com/suggestion/t/{tt}.json"
             try:
-                r = _proxy_get(api_url, [], stream=False)
+                status, body = _simple_get(api_url)
             except Exception as e:
                 return self._json(502, {"error": f"imdb fetch failed: {e}"})
-            if r.status_code != 200:
-                return self._json(502, {"error": f"imdb HTTP {r.status_code}"})
+            if status != 200:
+                return self._json(502, {"error": f"imdb HTTP {status}"})
             try:
-                data = json.loads(r.text)
+                data = json.loads(body)
             except Exception:
                 return self._json(502, {"error": "imdb response not JSON"})
             entries = (data.get("d") or [])
@@ -3170,13 +3304,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             first = safe[0]
             api_url = f"https://v3.sg.media-imdb.com/suggestion/{first}/{safe}.json"
             try:
-                r = _proxy_get(api_url, [], stream=False)
+                status, body = _simple_get(api_url)
             except Exception as e:
                 return self._json(502, {"error": f"imdb fetch failed: {e}"})
-            if r.status_code != 200:
-                return self._json(502, {"error": f"imdb HTTP {r.status_code}"})
+            if status != 200:
+                return self._json(502, {"error": f"imdb HTTP {status}"})
             try:
-                data = json.loads(r.text)
+                data = json.loads(body)
             except Exception:
                 return self._json(502, {"error": "imdb response not JSON"})
             results = []
@@ -3221,15 +3355,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid id"})
             api_url = f"https://v3-cinemeta.strem.io/meta/series/{tt}.json"
             try:
-                r = _proxy_get(api_url, [], stream=False)
+                status, body = _simple_get(api_url)
             except Exception as e:
                 return self._json(502, {"error": f"cinemeta fetch failed: {e}"})
-            if r.status_code != 200:
+            if status != 200:
                 # 307 = id is a movie, not a series; that's fine, frontend
                 # treats no-seasons as "stay on number inputs".
                 return self._json(200, {"id": tt, "name": "", "seasons": []})
             try:
-                data = json.loads(r.text)
+                data = json.loads(body)
             except Exception:
                 return self._json(502, {"error": "cinemeta response not JSON"})
             meta = data.get("meta") or {}
@@ -3915,10 +4049,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                # PYTHONPATH so the subprocess sees our auto-installed
+                # curl_cffi vendor dir (for users without pipx).
+                _env = dict(os.environ)
+                _env["PYTHONPATH"] = str(_CURL_CFFI_VENDOR) + (
+                    os.pathsep + _env["PYTHONPATH"] if _env.get("PYTHONPATH") else "")
                 proc = subprocess.Popen(
                     [CURL_PYTHON, "-u", HLS_FETCHER],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True,
+                    env=_env,
                 )
                 try:
                     proc.stdin.write(spec)
@@ -6863,7 +7003,15 @@ function openImdbSearch(initialQuery) {
       const r = await fetch(`/imdb/search?q=${encodeURIComponent(q)}`);
       if (!r.ok) {
         if (q !== lastQuery) return;
-        statusEl.textContent = "Search failed (HTTP " + r.status + ")";
+        // Pull the backend's error message out of the JSON body so
+        // the user sees WHY (e.g. "imdb fetch failed: <ImportError>")
+        // instead of just "HTTP 502".
+        let detail = "";
+        try {
+          const errJson = await r.json();
+          detail = errJson && errJson.error ? errJson.error : "";
+        } catch (e) {}
+        statusEl.textContent = "Search failed: " + (detail || ("HTTP " + r.status));
         return;
       }
       j = await r.json();
