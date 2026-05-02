@@ -34,10 +34,6 @@ from curl_cffi import requests as cr
 # Tunable: how many segments to fetch in parallel inside a single batch.
 # Most CDNs handle 8-16 simultaneous fetches fine; some throttle past that.
 PARALLEL_SEGMENTS = 8
-# Segments per write-batch. We download a batch in parallel, write it to
-# disk in order, then move on. Bounds peak memory to roughly
-# CHUNK_SEGMENTS × segment_size (~4 MB), so 50 × 4 = ~200 MB ceiling.
-CHUNK_SEGMENTS = 50
 
 
 _emit_lock = threading.Lock()
@@ -115,19 +111,21 @@ def _thread_session():
     return s
 
 
-def fetch(session, url, page_url, cookies, *, attempts=2):
-    # NB: this CDN's Cloudflare config 403s any request that bears a
-    # Referer (likely an anti-hotlink rule). Real Safari's <video>
-    # element omits Referer for cross-origin media fetches by default.
-    # We do the same. Origin/Sec-Fetch-* only matter for browser CORS
-    # preflight which curl_cffi doesn't do, so we skip them too.
-    #
-    # attempts=2 is a deliberate trade-off: one retry on transient 5xx
-    # is enough to recover most flapping requests, but a third+ try
-    # rarely helps and the cumulative backoff is what makes a flaky
-    # CDN feel like a slow CDN. With a 1s max backoff, worst-case
-    # retry cost is ~1.2s per failing segment — small enough that
-    # 10-20% segment-failure rates don't tank overall throughput.
+def fetch(session, url, page_url, cookies, *, attempts=2, max_backoff=1.0):
+    """Single-shot fetch with bounded retries.
+
+    NB: this CDN's Cloudflare config 403s any request that bears a
+    Referer (likely an anti-hotlink rule). Real Safari's <video>
+    element omits Referer for cross-origin media fetches by default.
+    We do the same. Origin/Sec-Fetch-* only matter for browser CORS
+    preflight which curl_cffi doesn't do, so we skip them too.
+
+    The defaults (attempts=2, max_backoff=1s) are tuned for the *main*
+    parallel pass: 1 retry then bail, so a flaky segment costs at most
+    ~1s of wall time inside the executor. Failed segments aren't dead —
+    they get queued for a sequential retry pass after the main fan-out
+    completes (see main()), where we use much more generous timing.
+    """
     headers = {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -149,13 +147,10 @@ def fetch(session, url, page_url, cookies, *, attempts=2):
             # Hard 4xx — don't retry; same response on second try.
             if r.status_code in (400, 404, 410):
                 return r
-            # 5xx, 401/403/429/451 — one retry with a fresh TLS
-            # profile, then we surface the failure. Cloudflare-flagged
-            # IPs don't recover on attempt 4 if they didn't on attempt
-            # 2, so further retries just waste wall time.
+            # 5xx, 401/403/429/451 — retry with a fresh TLS profile.
         except Exception as e:
             last_err = e
-        time.sleep(min(1.0, 0.5 * (2 ** i)) + random.uniform(0, 0.15))
+        time.sleep(min(max_backoff, 0.5 * (2 ** i)) + random.uniform(0, 0.15))
     if last_resp is not None:
         return last_resp
     raise last_err if last_err else RuntimeError("fetch failed (unknown)")
@@ -237,8 +232,6 @@ def main():
         emitted_progress = [0]
         progress_lock = threading.Lock()
         cancel_flag = threading.Event()
-        first_error = [None]
-        error_lock = threading.Lock()
 
         def emit_progress():
             with progress_lock:
@@ -247,24 +240,32 @@ def main():
             emit({"type": "progress", "idx": idx, "total": total,
                   "percent": idx / total * 100.0})
 
+        # ───── fetch_one: single-segment worker ────────────────────────
+        # Returns (i, data, err):
+        #   data is bytes on success, None on failure
+        #   err is None on success or a human-readable string on failure
+        # IMPORTANT: a failure here does *not* abort the run. Failed
+        # segments get queued and retried sequentially after the main
+        # parallel pass — the Cloudflare Worker behind these segments
+        # often returns transient 500s under our parallel burst, but
+        # the same URL succeeds 2-5 seconds later. Bailing immediately
+        # turns a recoverable hiccup into a failed download; deferring
+        # converts it back into a slight slowdown.
         def fetch_one(i, seg):
             if cancel_flag.is_set():
-                return i, None
+                return i, None, None
             try:
-                # Each worker uses its OWN curl_cffi session — sharing one
-                # across threads with concurrent requests is unsafe.
                 ts = _thread_session()
                 r = fetch(ts, seg, page_url, cookies)
-                if r.status_code not in (200, 206):
-                    msg = f"segment {i+1} HTTP {r.status_code}" + diag_for(seg, page_url, origin, cookies, r)
-                    raise RuntimeError(msg)
-                return i, r.content
+                if r.status_code in (200, 206):
+                    return i, r.content, None
+                # Non-2xx — defer for the retry pass. Capture
+                # diagnostics in case the retry also fails.
+                err = (f"segment {i+1} HTTP {r.status_code}"
+                       + diag_for(seg, page_url, origin, cookies, r))
+                return i, None, err
             except Exception as e:
-                with error_lock:
-                    if first_error[0] is None:
-                        first_error[0] = str(e)
-                cancel_flag.set()
-                return i, None
+                return i, None, f"segment {i+1}: {e}"
 
         try:
             with open(out_path, "wb") as f:
@@ -276,41 +277,99 @@ def main():
                         return
                     f.write(r.content)
 
+                pending = {}
+                next_to_write = 0
+                deferred = []  # list of segment indices that need retry
+                last_err = None  # most-recent failure string for diagnostics
+
                 ex = concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_SEGMENTS)
                 try:
-                    futures = [ex.submit(fetch_one, i, seg) for i, seg in enumerate(segs)]
-                    next_to_write = 0
-                    pending = {}
+                    futures = [ex.submit(fetch_one, i, seg)
+                               for i, seg in enumerate(segs)]
                     for fut in concurrent.futures.as_completed(futures):
-                        if cancel_flag.is_set() and first_error[0]:
-                            # On the first error, drop all pending work and
-                            # bail. Workers that haven't started yet will see
-                            # cancel_flag and short-circuit; in-flight ones
-                            # finish quickly because we don't wait for them.
+                        if cancel_flag.is_set():
                             break
                         try:
-                            i, data = fut.result()
+                            i, data, err = fut.result()
                         except Exception as e:
-                            with error_lock:
-                                if first_error[0] is None:
-                                    first_error[0] = str(e)
+                            # Unexpected — fetch_one should catch its own.
+                            last_err = str(e)
                             cancel_flag.set()
                             break
-                        if data is None:
-                            continue
-                        pending[i] = data
+                        if data is not None:
+                            pending[i] = data
+                            emit_progress()
+                            # Drain in-order writes whenever the next
+                            # expected index is now in pending.
+                            while next_to_write in pending:
+                                f.write(pending.pop(next_to_write))
+                                next_to_write += 1
+                        elif err is not None:
+                            # Defer; don't abort. The retry pass below
+                            # will surface a final error if it persists.
+                            deferred.append(i)
+                            last_err = err
+                finally:
+                    ex.shutdown(wait=False, cancel_futures=True)
+
+                if cancel_flag.is_set():
+                    emit({"type": "error", "error": last_err or "canceled"})
+                    return
+
+                # ───── Retry pass ─────────────────────────────────────
+                # Sequential, with cooldown between hits and a more
+                # generous attempt budget. The Cloudflare Workers
+                # serving these segments tend to recover within a few
+                # seconds — a fresh-isolate retry usually succeeds.
+                if deferred:
+                    deferred.sort()
+                    emit({"type": "status",
+                          "msg": f"retrying {len(deferred)} flaky segment(s)"})
+                    # Initial cooldown: give whichever upstream worker
+                    # blew up time to fall out of cache and warm a new
+                    # isolate. 2.5s is empirically enough; longer
+                    # waits don't help.
+                    time.sleep(2.5)
+                    for idx_pass, i in enumerate(deferred):
+                        seg = segs[i]
+                        try:
+                            # attempts=4 with max_backoff=2 → worst-case
+                            # ~6s per segment on the retry pass. With a
+                            # typical handful of deferred segments that's
+                            # tens of seconds added in the absolute worst
+                            # case — far better than failing the whole
+                            # rip 80% of the way through.
+                            r = fetch(session, seg, page_url, cookies,
+                                      attempts=4, max_backoff=2.0)
+                        except Exception as e:
+                            emit({"type": "error",
+                                  "error": f"segment {i+1} (retry): {e}"})
+                            return
+                        if r.status_code not in (200, 206):
+                            emit({"type": "error",
+                                  "error": f"segment {i+1} HTTP {r.status_code} (after retry)"
+                                  + diag_for(seg, page_url, origin, cookies, r)})
+                            return
+                        pending[i] = r.content
                         emit_progress()
                         while next_to_write in pending:
                             f.write(pending.pop(next_to_write))
                             next_to_write += 1
-                finally:
-                    ex.shutdown(wait=False, cancel_futures=True)
+                        # Small jitter between retry-pass segments so
+                        # we don't burst the upstream worker again.
+                        if idx_pass < len(deferred) - 1:
+                            time.sleep(0.3 + random.uniform(0, 0.3))
+
+                # Sanity: anything left in pending means an index hole,
+                # which would mean we logically lost data. Shouldn't
+                # happen with the deferred-retry pass succeeding.
+                if pending:
+                    missing = sorted(set(range(total)) - set(range(next_to_write)))
+                    emit({"type": "error",
+                          "error": f"internal: {len(missing)} segment(s) never written"})
+                    return
         except Exception as e:
             emit({"type": "error", "error": f"writer crashed: {e}"})
-            return
-
-        if first_error[0]:
-            emit({"type": "error", "error": first_error[0]})
             return
 
         emit({"type": "done"})

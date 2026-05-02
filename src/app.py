@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -4454,6 +4454,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self._json(500, {"ok": False, "message": str(e)})
                 return self._json(200, res)
 
+            if path == "/app/install_update":
+                # Kick off the in-app self-update flow. Returns a job id;
+                # the frontend then opens an SSE stream to /events/<id>
+                # to watch download/mount/copy progress. When the worker
+                # emits {type: 'ready'} the frontend prompts the user to
+                # apply via /app/install_update/apply.
+                jid = "appupd-" + uuid.uuid4().hex[:8]
+                with jobs_lock:
+                    jobs[jid] = {
+                        "id": jid,
+                        "queue": Queue(),
+                        "process": None,
+                        "status": "running",
+                        "filename": "",
+                    }
+                threading.Thread(target=_app_install_worker, args=(jid,),
+                                 daemon=True).start()
+                return self._json(200, {"job_id": jid})
+
+            if path == "/app/install_update/apply":
+                # Spawn the previously-staged update helper detached
+                # from us. The helper waits for our parent (Swift host)
+                # to exit before swapping the bundle, so the frontend
+                # is expected to POST /quit immediately after this.
+                res = _app_install_apply()
+                code = 200 if res.get("ok") else 400
+                return self._json(code, res)
+
             if path == "/history/add":
                 # Frontend-driven history insert. Used by the Swift HLS
                 # finalizer path which writes its output file directly
@@ -5305,6 +5333,38 @@ INDEX_HTML = r"""<!doctype html>
   }
   .rr-imdb-modal .rr-imdb-actions .primary:hover { background: #1010c0; }
 
+  /* === Self-update modal ============================================
+     Reuses the .rr-imdb-modal backdrop + .rr-imdb-card chrome. The
+     extras here are the progress strip (sunken bevel filled with the
+     same navy as primary actions) and the status line directly under
+     it. Width matches the kind/episode dialog so the page doesn't
+     reflow when reopened back-to-back. */
+  .rr-imdb-modal .rr-update-card {
+    min-width: 380px;
+    max-width: 460px;
+  }
+  .rr-imdb-modal .rr-update-bar {
+    height: 14px;
+    background: #fff;
+    border: 2px solid;
+    border-color: #404040 #fff #fff #404040;
+    margin: 4px 0 6px;
+    overflow: hidden;
+  }
+  .rr-imdb-modal .rr-update-fill {
+    height: 100%;
+    background: #000080;
+    width: 0%;
+    transition: width 180ms ease-out;
+  }
+  .rr-imdb-modal .rr-update-status {
+    font-size: 11px;
+    color: #404040;
+    margin: 0 0 10px;
+    min-height: 14px;
+    word-wrap: break-word;
+  }
+
   /* === IMDB title search ============================================
      Wider card than the kind/episode modal — the result list needs
      room. Reuses the .rr-imdb-modal backdrop. */
@@ -5634,11 +5694,11 @@ INDEX_HTML = r"""<!doctype html>
     <span id="sb-ytdlp-text">yt-dlp update</span>
   </div>
   <!-- App update pill: visible only when GitHub reports a newer release of
-       Rip Raptor than what's installed. Click → opens the release page in
-       the user's default browser. Distinct cyan from the amber yt-dlp pill
-       so the two don't blur together when both are visible. -->
+       Rip Raptor than what's installed. Click → in-app updater (downloads
+       the new dmg, swaps the bundle, relaunches). Distinct cyan from the
+       amber yt-dlp pill so the two don't blur together when both visible. -->
   <div class="seg seg-btn" id="sb-app-update" style="display:none;"
-       onclick="openAppRelease()" title="Click to download the latest Rip Raptor release">
+       onclick="openAppUpdate()" title="Click to update Rip Raptor in-place">
     <span id="sb-app-text">app update</span>
   </div>
   <div class="seg" id="sb-jobs">0 active</div>
@@ -6095,8 +6155,10 @@ async function checkAppVersion(force) {
     if (!pill || !txt) return j;
     if (j.update_available && j.installed && j.latest) {
       txt.textContent = `Rip Raptor → ${j.latest}`;
-      pill.title = `Installed v${j.installed} · v${j.latest} available · click to open the release page`;
+      pill.title = `Installed v${j.installed} · v${j.latest} available · click to update in-place`;
       pill.dataset.releaseUrl = j.release_url || "";
+      pill.dataset.installed = j.installed || "";
+      pill.dataset.latest = j.latest || "";
       pill.style.display = "";
     } else {
       pill.style.display = "none";
@@ -6104,22 +6166,165 @@ async function checkAppVersion(force) {
     return j;
   } catch (e) { return null; }
 }
-async function openAppRelease() {
-  // window.open() doesn't work in WKWebView without a custom UIDelegate,
-  // so we POST to /open-url which `open`s the URL via the OS — that
-  // routes to the user's default browser as expected. The backend
-  // whitelists URLs to the project repo so this can't be turned into
-  // a generic browser-launcher.
+// In-app self-update flow.
+//
+// The actual download/mount/copy work happens in a Python background
+// worker; we just stream its progress events over SSE and pivot the
+// UI between three states: confirm → progress → ready-to-relaunch.
+//
+// Why a custom modal instead of confirm()/alert(): WKWebView's native
+// dialogs are basic and the relaunch step takes ~10-30 s, so we need a
+// surface that can show "Downloading 42% / Mounting / Copying" without
+// blocking the JS event loop. Reuses the .rr-imdb-modal backdrop class
+// so styling stays consistent with the IMDB / kind-prompt dialogs.
+async function openAppUpdate() {
+  // Bail out if a previous update modal is still around (rapid double
+  // click). Re-opening would orphan the SSE stream from the first one.
+  const existing = document.getElementById("rr-update-modal");
+  if (existing) { existing.remove(); }
+
   const pill = document.getElementById("sb-app-update");
-  const url = (pill && pill.dataset.releaseUrl) ||
-              "https://github.com/henri-cmd/ripraptor/releases/latest";
-  try {
-    await fetch("/open-url", {
+  const installed = (pill && pill.dataset.installed) || "";
+  const latest    = (pill && pill.dataset.latest)    || "";
+  const releaseUrl = (pill && pill.dataset.releaseUrl) ||
+                     "https://github.com/henri-cmd/ripraptor/releases/latest";
+
+  const modal = document.createElement("div");
+  modal.id = "rr-update-modal";
+  modal.className = "rr-imdb-modal";
+  modal.innerHTML = `
+    <div class="rr-imdb-card rr-update-card" role="dialog" aria-modal="true"
+         aria-labelledby="rr-update-h">
+      <h3 id="rr-update-h">Update Rip Raptor</h3>
+      <p id="rr-update-msg">
+        Installed <strong>v${installed || "?"}</strong> ·
+        Latest <strong>v${latest || "?"}</strong>.
+        Update will download the new app, replace the existing copy in
+        Applications, and relaunch.
+      </p>
+      <div id="rr-update-progress" style="display:none;">
+        <div class="rr-update-bar"><div class="rr-update-fill" style="width:0%"></div></div>
+        <div class="rr-update-status mono" id="rr-update-status">starting…</div>
+      </div>
+      <div class="rr-imdb-actions">
+        <button id="rr-update-notes" type="button">Release notes</button>
+        <button id="rr-update-cancel" type="button">Cancel</button>
+        <button id="rr-update-go" type="button" class="primary">Update now</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const $msg = modal.querySelector("#rr-update-msg");
+  const $prog = modal.querySelector("#rr-update-progress");
+  const $fill = modal.querySelector(".rr-update-fill");
+  const $status = modal.querySelector("#rr-update-status");
+  const $go = modal.querySelector("#rr-update-go");
+  const $cancel = modal.querySelector("#rr-update-cancel");
+  const $notes = modal.querySelector("#rr-update-notes");
+
+  let evt = null;
+  function close() {
+    if (evt) { try { evt.close(); } catch(e) {} evt = null; }
+    try { modal.remove(); } catch(e) {}
+  }
+  $cancel.addEventListener("click", close);
+  modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+  $notes.addEventListener("click", () => {
+    fetch("/open-url", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({url}),
-    });
-  } catch (e) {}
+      body: JSON.stringify({url: releaseUrl}),
+    }).catch(() => {});
+  });
+
+  $go.addEventListener("click", async () => {
+    // Stage 2: kick off the install worker, swap the buttons to a
+    // single "Cancel" until ready.
+    $go.disabled = true;
+    $go.textContent = "Working…";
+    $msg.style.display = "none";
+    $prog.style.display = "";
+    let jobId = null;
+    try {
+      const r = await fetch("/app/install_update", { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+      jobId = j.job_id;
+    } catch (e) {
+      $status.textContent = "failed to start update: " + (e.message || e);
+      $go.style.display = "none";
+      $cancel.textContent = "Close";
+      return;
+    }
+
+    // Stream progress events. Final state is either {type: 'ready'}
+    // or {type: 'error', error: '...'}.
+    evt = new EventSource("/events/" + jobId);
+    let ready = false;
+    evt.onmessage = (msg) => {
+      let d;
+      try { d = JSON.parse(msg.data); } catch (e) { return; }
+      if (d.type === "status") {
+        $status.textContent = d.msg || "";
+      } else if (d.type === "progress") {
+        const pct = Math.max(0, Math.min(100, +d.percent || 0));
+        $fill.style.width = pct.toFixed(1) + "%";
+        const mb = (d.got || 0) / 1048576;
+        const tot = (d.total || 0) / 1048576;
+        $status.textContent = `downloading… ${mb.toFixed(1)} / ${tot.toFixed(1)} MB`;
+      } else if (d.type === "ready") {
+        ready = true;
+        $fill.style.width = "100%";
+        $status.textContent = "Ready. Click below to relaunch into the new version.";
+        $go.style.display = "";
+        $go.disabled = false;
+        $go.textContent = "Relaunch & update";
+        $go.onclick = applyUpdate;
+        $cancel.textContent = "Later";
+      } else if (d.type === "error") {
+        $status.textContent = "Update failed: " + (d.error || "unknown");
+        $go.style.display = "none";
+        $cancel.textContent = "Close";
+        try { evt.close(); } catch(e) {}
+      }
+    };
+    evt.onerror = () => {
+      // SSE errors are noisy on Safari; only treat as fatal if we
+      // haven't reached "ready" yet.
+      if (!ready) {
+        $status.textContent = "lost connection to update worker";
+        $go.style.display = "none";
+        $cancel.textContent = "Close";
+      }
+    };
+  });
+
+  async function applyUpdate() {
+    $go.disabled = true;
+    $go.textContent = "Relaunching…";
+    $cancel.style.display = "none";
+    try {
+      const r = await fetch("/app/install_update/apply", { method: "POST" });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || ("HTTP " + r.status));
+    } catch (e) {
+      $status.textContent = "Apply failed: " + (e.message || e);
+      $go.disabled = false;
+      $go.textContent = "Retry";
+      $cancel.style.display = "";
+      $cancel.textContent = "Close";
+      return;
+    }
+    // Helper is now detached and waiting for our parent (the Swift
+    // host) to die. Trigger /quit and the helper takes over from
+    // there. Show a transient "see you in a sec" message in case
+    // the relaunch is slower than expected.
+    $status.textContent = "quitting current app — the new version will open shortly…";
+    setTimeout(() => {
+      fetch("/quit", { method: "POST" }).catch(() => {});
+    }, 350);
+  }
 }
 // Stagger the app check after the yt-dlp one so we don't fire two
 // GitHub requests back-to-back at startup.
@@ -13506,6 +13711,310 @@ def _app_latest_release() -> tuple[str, str]:
         return tag, url
     except Exception:
         return "", ""
+
+
+# ───── In-app self-update ─────────────────────────────────────────────
+# Lets the user upgrade Rip Raptor without re-downloading the dmg by
+# hand, mounting it, dragging into Applications, etc. Flow:
+#
+#   1. /app/install_update creates a job and runs _app_install_worker
+#      in the background. Worker downloads the latest .dmg from GitHub,
+#      mounts it via hdiutil, ditto's the new .app to a /tmp staging
+#      dir, and writes a small bash helper script that knows how to
+#      swap the bundle once we exit. Worker streams JSONL events to
+#      /events/<job_id> the same way HLS fetches do.
+#   2. Once the worker emits {type: "ready"}, the user clicks
+#      "Relaunch & Update". The frontend POSTs /app/install_update/apply
+#      which spawns the helper script detached from this process, then
+#      POSTs /quit to shut down the server.
+#   3. The Swift host quits, the helper script (now reparented to init)
+#      sees our PID die, sleeps a moment, atomically swaps the bundle,
+#      and `open`s the new one.
+#
+# This works because macOS lets you delete/replace running app bundles
+# (unlike Windows). The helper just needs to wait for the user-visible
+# process to fully exit so the relaunch gets a clean state.
+
+_app_install_lock = threading.Lock()
+_app_install_state: dict = {
+    "helper": "",   # path to staged bash helper script
+    "staged": "",   # path to new .app waiting in /tmp
+    "bundle": "",   # path to existing install (the swap target)
+}
+
+
+def _locate_bundle_root() -> Path | None:
+    """Find the path to the running .app bundle, if we're inside one.
+    Walks up from this module's path looking for a *.app component.
+    Returns None when running from the dev source tree (no .app)."""
+    here = Path(__file__).resolve()
+    for p in [here, *here.parents]:
+        if p.suffix == ".app":
+            return p
+    return None
+
+
+def _latest_dmg_asset() -> tuple[str, str, int]:
+    """Return (download_url, asset_name, size_bytes) for the most
+    recent .dmg asset on GitHub releases/latest. ('', '', 0) on
+    failure or when the latest release has no dmg."""
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(
+            "https://api.github.com/repos/henri-cmd/ripraptor/releases/latest",
+            headers={"User-Agent": "RipRaptor/" + APP_VERSION})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for a in (data.get("assets") or []):
+            n = (a.get("name") or "").lower()
+            if n.endswith(".dmg"):
+                return (a.get("browser_download_url") or "",
+                        a.get("name") or "",
+                        int(a.get("size") or 0))
+    except Exception:
+        pass
+    return "", "", 0
+
+
+def _app_install_worker(jid: str) -> None:
+    """Background worker for in-app self-update. Posts events to the
+    job queue the same way HLS fetcher events flow. Final event is
+    either {type: 'ready'} (helper staged, awaiting apply call) or
+    {type: 'error', error: '...'}.
+    """
+    import shlex
+    import tempfile
+    import textwrap
+
+    with jobs_lock:
+        job = jobs.get(jid)
+    if not job:
+        return
+    q: Queue = job["queue"]
+
+    def post(**kw):
+        q.put(kw)
+
+    mountpoint = None
+    try:
+        bundle = _locate_bundle_root()
+        if not bundle:
+            post(type="error", error="not running from a .app bundle (dev mode)")
+            return
+        if not bundle.exists():
+            post(type="error", error=f"bundle path missing: {bundle}")
+            return
+
+        # ───── Resolve dmg URL ────────────────────────────────────
+        post(type="status", msg="checking latest release")
+        dmg_url, dmg_name, dmg_size = _latest_dmg_asset()
+        if not dmg_url:
+            post(type="error", error="no .dmg asset found on latest GitHub release")
+            return
+
+        # ───── Download dmg ───────────────────────────────────────
+        post(type="status", msg=f"downloading {dmg_name}")
+        from urllib.request import Request, urlopen
+        fd, tmp_dmg_path = tempfile.mkstemp(prefix="ripraptor-update-", suffix=".dmg")
+        os.close(fd)
+        try:
+            req = Request(dmg_url,
+                          headers={"User-Agent": "RipRaptor/" + APP_VERSION})
+            with urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length") or dmg_size or 0)
+                got = 0
+                last_percent = -1
+                with open(tmp_dmg_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            pct = int(got / total * 100)
+                            # Throttle progress events — one per percent
+                            # is plenty and keeps the SSE stream cheap.
+                            if pct != last_percent:
+                                last_percent = pct
+                                post(type="progress", got=got, total=total,
+                                     percent=got / total * 100.0)
+        except Exception as e:
+            post(type="error", error=f"download failed: {e}")
+            return
+
+        # ───── Mount via hdiutil ──────────────────────────────────
+        post(type="status", msg="mounting update")
+        mountpoint = tempfile.mkdtemp(prefix="ripraptor-update-mnt-")
+        try:
+            res = subprocess.run(
+                ["hdiutil", "attach", "-nobrowse", "-noverify", "-quiet",
+                 "-mountpoint", mountpoint, tmp_dmg_path],
+                capture_output=True, text=True, timeout=60)
+            if res.returncode != 0:
+                post(type="error",
+                     error=f"mount failed: {(res.stderr or res.stdout).strip()[-200:]}")
+                return
+        except Exception as e:
+            post(type="error", error=f"mount failed: {e}")
+            return
+
+        # ───── Locate the new .app inside the dmg ─────────────────
+        new_app = None
+        try:
+            for entry in os.listdir(mountpoint):
+                if entry.endswith(".app"):
+                    new_app = Path(mountpoint) / entry
+                    break
+        except Exception:
+            pass
+        if not new_app:
+            post(type="error", error="no .app found inside disk image")
+            return
+
+        # ───── Stage to /tmp via ditto ────────────────────────────
+        # `cp -R` doesn't preserve resource forks / xattrs cleanly on
+        # signed bundles; ditto is what installers use. Stage to a
+        # fresh dir so the swap is a single rename.
+        post(type="status", msg="copying new app")
+        stage_dir = Path(tempfile.mkdtemp(prefix="ripraptor-update-stg-"))
+        staged = stage_dir / new_app.name
+        try:
+            res = subprocess.run(
+                ["ditto", str(new_app), str(staged)],
+                capture_output=True, text=True, timeout=180)
+            if res.returncode != 0:
+                post(type="error",
+                     error=f"copy failed: {(res.stderr or res.stdout).strip()[-200:]}")
+                return
+        except Exception as e:
+            post(type="error", error=f"copy failed: {e}")
+            return
+
+        # Detach the dmg now that we've copied out — leaving it
+        # mounted just adds a stray volume in Finder.
+        try:
+            subprocess.run(["hdiutil", "detach", mountpoint, "-force", "-quiet"],
+                           capture_output=True, timeout=30)
+        except Exception:
+            pass
+        mountpoint = None
+        try:
+            os.unlink(tmp_dmg_path)
+        except Exception:
+            pass
+
+        # ───── Write the swap-and-relaunch helper ─────────────────
+        # We wait on the Swift host's PID — that's the user-facing
+        # process; we (Python) are its child and exit when it does.
+        # `kill -0` is a presence check (signal 0 doesn't actually
+        # send a signal). Sleep loop caps at 30s; macOS lets us
+        # replace running bundles regardless, so we proceed even
+        # if the wait times out.
+        parent_pid = os.getppid()
+        APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+        log_path = APP_SUPPORT / "update.log"
+        helper_fd, helper_path = tempfile.mkstemp(
+            prefix="ripraptor-update-helper-", suffix=".sh")
+        os.close(helper_fd)
+        helper_script = textwrap.dedent(f"""\
+            #!/bin/bash
+            # Rip Raptor self-update helper. Spawned detached from the
+            # running app; waits for the app to exit, then swaps the
+            # installed bundle for the freshly-staged copy and
+            # relaunches it.
+            set -u
+            LOG={shlex.quote(str(log_path))}
+            STAGED={shlex.quote(str(staged))}
+            INSTALL={shlex.quote(str(bundle))}
+            PARENT_PID={parent_pid}
+            {{
+              echo ""
+              echo "[$(date)] update helper starting (parent pid $PARENT_PID)"
+              for i in $(seq 1 60); do
+                if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+                  break
+                fi
+                sleep 0.5
+              done
+              # Small grace period in case launch services has not
+              # fully released file handles in the bundle yet.
+              sleep 0.8
+              echo "[$(date)] swapping $INSTALL <- $STAGED"
+              # Use ditto for the swap so xattrs/codesign survive.
+              # The previous bundle is deleted *after* the new copy
+              # lands, in case the copy fails midway (we'd rather
+              # leave the old one in place than have nothing).
+              if ditto "$STAGED" "$INSTALL.new"; then
+                rm -rf "$INSTALL"
+                mv "$INSTALL.new" "$INSTALL"
+                # Strip the quarantine xattr so Gatekeeper doesn't
+                # re-prompt for the brand-new bundle the user just
+                # consented to install.
+                xattr -dr com.apple.quarantine "$INSTALL" 2>/dev/null || true
+                echo "[$(date)] swap complete; relaunching"
+                # rm leftover stage dir
+                rm -rf "$(dirname "$STAGED")" 2>/dev/null || true
+                # And the helper itself, on a delay (we're still
+                # executing it — can't unlink while running).
+                (sleep 2; rm -f "$0") &
+                open "$INSTALL"
+              else
+                echo "[$(date)] copy failed; leaving existing install in place"
+                open "$INSTALL"
+              fi
+              echo "[$(date)] done"
+            }} >> "$LOG" 2>&1
+        """)
+        with open(helper_path, "w") as f:
+            f.write(helper_script)
+        os.chmod(helper_path, 0o755)
+
+        with _app_install_lock:
+            _app_install_state["helper"] = helper_path
+            _app_install_state["staged"] = str(staged)
+            _app_install_state["bundle"] = str(bundle)
+
+        post(type="ready", msg="ready to relaunch")
+    except Exception as e:
+        post(type="error", error=str(e))
+    finally:
+        # Best-effort cleanup of the mountpoint if we errored before
+        # detaching above.
+        if mountpoint:
+            try:
+                subprocess.run(["hdiutil", "detach", mountpoint, "-force", "-quiet"],
+                               capture_output=True, timeout=20)
+            except Exception:
+                pass
+        q.put({"type": "_close"})
+
+
+def _app_install_apply() -> dict:
+    """Spawn the staged update helper detached from this process.
+    Returns {ok, error?}. Caller is expected to follow up with /quit
+    to shut down the running app — the helper waits for our parent
+    PID to die before doing the swap."""
+    with _app_install_lock:
+        helper = _app_install_state.get("helper")
+    if not helper or not os.path.exists(helper):
+        return {"ok": False, "error": "no staged update — call /app/install_update first"}
+    try:
+        # start_new_session=True puts the helper in its own process
+        # group so it survives our shutdown. close_fds prevents it
+        # from inheriting file descriptors that would otherwise pin
+        # them open. DEVNULL on stdio so it has no terminal to die on.
+        subprocess.Popen(
+            ["/bin/bash", helper],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _parse_semver(s: str) -> tuple:

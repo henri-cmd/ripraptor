@@ -731,6 +731,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         ? "Server exited (status \(p.terminationStatus))"
                         : "Server exited (status \(p.terminationStatus)):\n\n\(tail)"
                     self.failStart(detail)
+                } else {
+                    // Server died after we'd already loaded the UI. With
+                    // a clean exit (status 0) this is the user-initiated
+                    // /quit path — could be the in-app updater asking us
+                    // to step out so a helper can swap the bundle, or
+                    // could just be the app shutting down from the
+                    // sidebar quit button. Either way, terminate the
+                    // host app: there's no functioning backend left, so
+                    // staying open with a broken WebView is the worst
+                    // possible UX.
+                    //
+                    // Non-zero exits are a Python crash mid-session;
+                    // those are rare enough that we don't try to auto-
+                    // relaunch — let the user see the empty webview and
+                    // file a bug.
+                    if p.terminationStatus == 0 {
+                        NSApp.terminate(nil)
+                    }
                 }
             }
         }
