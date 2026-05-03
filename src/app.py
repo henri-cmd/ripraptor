@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -4840,11 +4840,15 @@ INDEX_HTML = r"""<!doctype html>
   }
   button:disabled { color: #808080; text-shadow: 1px 1px 0 #ffffff; cursor: not-allowed; }
   button.danger { color: #800000; }
-  /* Paste button is a sibling of Extract in the URL row. Same default
-     min-width (70px) keeps them visually matched; font-size bump just
-     makes the lone emoji read at a comparable optical weight to the
-     "Extract" text next to it. */
-  #btn-paste-url { font-size: 14px; line-height: 1; }
+  /* Paste button is a sibling of Extract in the URL row. Override the
+     default button min-width (70px) so the button shrinks to fit just
+     the 📋 emoji — keeps the URL <input> the maximum useful width. */
+  #btn-paste-url {
+    min-width: 0;
+    padding: 3px 8px;
+    font-size: 14px;
+    line-height: 1;
+  }
   /* Rip It! is the headline action — green text in the otherwise-mono
      Win98 chrome puts a clear "this is GO" cue on the card. The colour
      overrides the default black inherited from `button {}`; we keep
