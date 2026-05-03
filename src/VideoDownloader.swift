@@ -1117,6 +1117,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let total = event["total"] as? Int ?? 0
             notifyHls("__vdHlsProgress", taskId: taskId,
                       extra: ["percent": pct, "idx": idx, "total": total])
+        case "variant":
+            // The fetcher emits one of these once it has picked the
+            // video variant + audio rendition. Forward the whole
+            // payload to JS so the UI can surface "1080p @ 6.4 Mbps ·
+            // AAC 5.1 (en)" alongside the progress bar.
+            var extra: [String: Any] = [:]
+            for (k, v) in event where k != "type" {
+                extra[k] = v
+            }
+            notifyHls("__vdHlsVariant", taskId: taskId, extra: extra)
         case "done":
             finishHLSDownload(dl: dl)
         case "error":

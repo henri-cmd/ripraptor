@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -4040,6 +4040,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "page_url": page_url,
                     "cookies": cookies,
                     "out_path": out_path,
+                    # Bundled ffmpeg, used by the helper to mux separate
+                    # video + audio renditions when the master playlist
+                    # uses #EXT-X-MEDIA audio groups (the modern HLS
+                    # default — required for 5.1 / multi-language).
+                    "ffmpeg_path": _FFMPEG,
                 }).encode()
 
                 self.send_response(200)
@@ -6505,6 +6510,76 @@ window.__vdSniffProgress = function(sniffId, n) {
 };
 
 const hlsTasks = new Map();
+
+// Per-source quality labels for the "↗ host" buttons on cards. Populated
+// by the multi-sniff finalize step once each streaming front-end has
+// returned its master playlist. setSourceButtons reads from here so the
+// user sees "↗ 111movies.net · 1080p · 6.4 Mbps · AAC 5.1" instead of
+// just the bare hostname — lets them visually pick the best source when
+// the same title is offered by multiple back-ends.
+const sourceVariantLabels = new Map();
+
+function parseTopVariantLabel(masterText) {
+  // Lightweight HLS master-playlist parser, *display only*. Mirrors the
+  // logic in hls_fetcher.py's parse_master + pick_best_audio so the UI
+  // shows what the helper will actually pick. Returns "" on parse
+  // failure / single-rendition manifests (no quality difference to
+  // surface).
+  if (!masterText || masterText.indexOf("#EXT-X-STREAM-INF") < 0) return "";
+  const lines = masterText.split(/\r?\n/);
+  let topH = 0, topBw = 0, audioGroup = "";
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s.startsWith("#EXT-X-STREAM-INF:")) continue;
+    const a = s.slice("#EXT-X-STREAM-INF:".length);
+    const mh = a.match(/RESOLUTION=\d+x(\d+)/);
+    const mb = a.match(/BANDWIDTH=(\d+)/);
+    const ma = a.match(/AUDIO="([^"]+)"/);
+    const h  = mh ? parseInt(mh[1], 10) : 0;
+    const bw = mb ? parseInt(mb[1], 10) : 0;
+    if (h > topH || (h === topH && bw > topBw)) {
+      topH = h; topBw = bw;
+      if (ma) audioGroup = ma[1];
+    }
+  }
+  // Best audio in the chosen group: prefer English / no-tag, highest
+  // channels. Skip URI-less entries (those describe muxed audio).
+  let aTxt = "";
+  if (audioGroup) {
+    let bestCh = 0, bestLang = "";
+    for (const line of lines) {
+      const s = line.trim();
+      if (!s.startsWith("#EXT-X-MEDIA:")) continue;
+      const a = s.slice("#EXT-X-MEDIA:".length);
+      if (!/TYPE=AUDIO/.test(a)) continue;
+      const mg = a.match(/GROUP-ID="([^"]+)"/);
+      if (!mg || mg[1] !== audioGroup) continue;
+      if (!/URI="/.test(a)) continue;
+      const lang = (a.match(/LANGUAGE="([^"]+)"/) || [,""])[1].toLowerCase();
+      const ch   = parseInt((a.match(/CHANNELS="([^"]+)"/) || [,"2"])[1].split("/")[0], 10) || 2;
+      // Prefer English / no-tag over foreign; within that, highest channels.
+      const langRank = (lang === "en" || lang === "eng") ? 0 : (lang === "" || lang === "und") ? 1 : 2;
+      const bestRank = (bestLang === "en" || bestLang === "eng") ? 0 : (bestLang === "" || bestLang === "und") ? 1 : 2;
+      if (langRank < bestRank || (langRank === bestRank && ch > bestCh)) {
+        bestCh = ch;
+        bestLang = lang;
+      }
+    }
+    if (bestCh) {
+      const chTxt = bestCh === 6 ? "5.1" : bestCh === 8 ? "7.1" : bestCh === 2 ? "stereo" : `${bestCh}ch`;
+      aTxt = `AAC ${chTxt}${bestLang && bestLang !== "en" ? ` (${bestLang})` : ""}`;
+    }
+  }
+  const parts = [];
+  if (topH) parts.push(`${topH}p`);
+  if (topBw) {
+    const mbps = topBw / 1_000_000;
+    parts.push(mbps >= 1 ? `${mbps.toFixed(1)} Mbps` : `${Math.round(topBw/1000)} kbps`);
+  }
+  if (aTxt) parts.push(aTxt);
+  return parts.join(" · ");
+}
+
 window.__vdHlsStatus = function(d) {
   const card = hlsTasks.get(d.taskId);
   if (card) card.onHlsStatus(d);
@@ -6520,6 +6595,14 @@ window.__vdHlsDone = function(d) {
 window.__vdHlsError = function(d) {
   const card = hlsTasks.get(d.taskId);
   if (card) { hlsTasks.delete(d.taskId); card.onHlsError(d); }
+};
+// New in 0.1.8 — fired once per rip after the helper picks the video
+// variant + audio rendition. Payload carries `video`, `audio`, `ladder`,
+// and `audio_groups`. The card stores it so subsequent progress lines
+// can annotate "Downloading · 47%" with "1080p · AAC 5.1 (en)".
+window.__vdHlsVariant = function(d) {
+  const card = hlsTasks.get(d.taskId);
+  if (card) card.onHlsVariant(d);
 };
 const canHlsDownload = () => !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vdHlsStart);
 const canEditor = () => !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vdEditorPrepare);
@@ -7652,7 +7735,14 @@ function makeCard(url) {
   // arrived because the early "no data yet" estimate defaulted to
   // ~30s, then the monotonic clamp pinned it).
   let _ripStartedAt = 0;
-  function _ripReset() { _ripStartedAt = 0; }
+  // HLS variant info (populated once per rip when the helper picks the
+  // video + audio rendition; appended to status lines like "Downloading
+  // · 47% · 1080p · AAC 5.1 (en)") and the most recent progress event
+  // (so the variant handler can re-render the same status line as soon
+  // as it arrives, without waiting for the next progress tick).
+  let hlsVariantLabel = "";
+  let _lastHlsProgress = null;
+  function _ripReset() { _ripStartedAt = 0; hlsVariantLabel = ""; _lastHlsProgress = null; }
   // Multi-source sniff state. Single-source paths (legacy startSniff)
   // populate sniffSources with one entry; the IMDB flow uses
   // startMultiSniff which fills it with N entries (one per streaming
@@ -7849,8 +7939,14 @@ function makeCard(url) {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "source-link-btn";
-        btn.title = "Open " + u;
-        btn.textContent = `↗ ${host}`;
+        // Per-source quality annotation. Populated by multi-sniff
+        // after each source's master playlist comes back; lets the
+        // user pick the best source visually rather than blindly.
+        // Falls back to plain "↗ host" when we don't have a master
+        // for this URL (legacy direct-paste path).
+        const qLabel = sourceVariantLabels.get(u) || "";
+        btn.textContent = qLabel ? `↗ ${host} · ${qLabel}` : `↗ ${host}`;
+        btn.title = qLabel ? `${u}\n${qLabel}` : "Open " + u;
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
           fetch("/open-url", {
@@ -8279,6 +8375,20 @@ function makeCard(url) {
         card.setStatus("No streams found on any source. Try the picker manually.", "err");
         return;
       }
+      // Annotate each source's "↗ host" button with the top variant
+      // it advertises (resolution / bandwidth / audio channel layout).
+      // Lets the user eyeball which source has the best quality
+      // before clicking. Done before activateSource so the buttons
+      // render with labels on first paint.
+      for (const src of ok) {
+        const playlists = src.data.playlists || {};
+        const masterText = playlists.masterContent || src.data.manifestContent || "";
+        try {
+          const lbl = parseTopVariantLabel(masterText);
+          if (lbl) sourceVariantLabels.set(src.url, lbl);
+        } catch (e) {}
+      }
+
       // Activate the first usable source so card-state vars
       // (sniffPlaylists, cookies, sniffId, etc.) are populated. The
       // dropdown's `change` listener swaps them when the user picks
@@ -8359,9 +8469,46 @@ function makeCard(url) {
       }
       updateStatusBar();
     },
+    onHlsVariant(d) {
+      // Stash the picks so the progress + done lines can annotate
+      // "Downloading · 47%" with "1080p · AAC 5.1 (en)". Format once
+      // here; cheaper than rebuilding the string per progress tick.
+      const v = d.video || {};
+      const a = d.audio || {};
+      const parts = [];
+      if (v.height) parts.push(`${v.height}p`);
+      if (v.bandwidth) {
+        const mbps = v.bandwidth / 1_000_000;
+        parts.push(mbps >= 1 ? `${mbps.toFixed(1)} Mbps` : `${Math.round(v.bandwidth/1000)} kbps`);
+      }
+      if (a.separate) {
+        let aTxt = "AAC";
+        // CHANNELS in the manifest is "2"/"6"/"6/JOC". Map common
+        // values to friendly labels.
+        const ch = (a.channels || "").split("/")[0];
+        if (ch === "6") aTxt += " 5.1";
+        else if (ch === "8") aTxt += " 7.1";
+        else if (ch === "2" || ch === "") aTxt += " stereo";
+        else aTxt += ` ${ch}ch`;
+        if (a.language) aTxt += ` (${a.language})`;
+        parts.push(aTxt);
+      } else if (a.separate === false) {
+        parts.push("muxed audio");
+      }
+      hlsVariantLabel = parts.length ? parts.join(" · ") : "";
+      // Re-render whatever is currently shown so the label appears
+      // right away rather than waiting for the next progress tick.
+      if (_lastHlsProgress) {
+        const p = _lastHlsProgress;
+        const elapsed = (Date.now() - (_ripStartedAt || Date.now())) / 1000;
+        const eta = fmtETA(elapsed, (p.percent||0) / 100);
+        card.setStatus(`Downloading · ${(p.percent||0).toFixed(0)}% (${p.idx}/${p.total} segments)${eta ? ` · ETA ${eta}` : ""}${hlsVariantLabel ? ` · ${esc(hlsVariantLabel)}` : ""}`);
+      }
+    },
     onHlsProgress(d) {
       el.dataset.state = "downloading";
       if (!_ripStartedAt) _ripStartedAt = Date.now();
+      _lastHlsProgress = d;
       const pct = (d.percent||0);
       // Simple proportional bar — segment count is authoritative,
       // no estimator games. Bar tracks downloaded / total exactly.
@@ -8370,7 +8517,7 @@ function makeCard(url) {
       // imperfect estimate just shows up as a slightly-off number).
       const elapsed = (Date.now() - _ripStartedAt) / 1000;
       const eta = fmtETA(elapsed, pct / 100);
-      card.setStatus(`Downloading · ${pct.toFixed(0)}% (${d.idx}/${d.total} segments)${eta ? ` · ETA ${eta}` : ""}`);
+      card.setStatus(`Downloading · ${pct.toFixed(0)}% (${d.idx}/${d.total} segments)${eta ? ` · ETA ${eta}` : ""}${hlsVariantLabel ? ` · ${esc(hlsVariantLabel)}` : ""}`);
     },
     onHlsDone(d) {
       _ripReset();
