@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -4840,6 +4840,20 @@ INDEX_HTML = r"""<!doctype html>
   }
   button:disabled { color: #808080; text-shadow: 1px 1px 0 #ffffff; cursor: not-allowed; }
   button.danger { color: #800000; }
+  /* Paste button is a sibling of Extract in the URL row. Same default
+     min-width (70px) keeps them visually matched; font-size bump just
+     makes the lone emoji read at a comparable optical weight to the
+     "Extract" text next to it. */
+  #btn-paste-url { font-size: 14px; line-height: 1; }
+  /* Rip It! is the headline action — green text in the otherwise-mono
+     Win98 chrome puts a clear "this is GO" cue on the card. The colour
+     overrides the default black inherited from `button {}`; we keep
+     the bold weight (already inherited) so it reads from across the
+     screen even at 11px. Also applies the green to the button when
+     it's relabelled "Rip Again!" after a successful run — same role,
+     same affordance. */
+  .job .start { color: #006400; }
+  .job .start:disabled { color: #80a080; }
 
   .row { display: flex; gap: 6px; align-items: center; }
   .row > input, .row > select { flex: 1; }
@@ -4857,7 +4871,26 @@ INDEX_HTML = r"""<!doctype html>
     min-width: 0;
     overflow: hidden;
   }
-  .job-head { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  .job-head { display: flex; gap: 8px; align-items: center; min-width: 0; position: relative; }
+  /* Top-right close button. Lives inside .job-head so it sits at the
+     card's top edge regardless of whether the meta/options row grows
+     (long titles, multi-source buttons, ed-summary, etc). 26×22 to
+     match the card-move-stack arrow buttons; same maroon as the old
+     inline Cancel so destructive-action coloring stays consistent. */
+  .card-x {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    min-width: 0;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    font-size: 12px;
+    line-height: 18px;
+    font-weight: bold;
+    flex: 0 0 auto;
+  }
+  .card-x:hover:not(:disabled) { background: #ffd0d0; }
   /* Per-card reorder stack — only shown for cards inside #pending. Once
      a card has graduated to Stage 3 (#jobs) the arrows disappear; you
      can't reorder a download in flight. */
@@ -5718,7 +5751,7 @@ INDEX_HTML = r"""<!doctype html>
       <legend>2. Extraction</legend>
       <div class="row">
         <input id="url" placeholder="Enter URL" autofocus autocomplete="off" spellcheck="false">
-        <button id="btn-paste-url" type="button" onclick="pasteUrlFromClipboard()" title="Paste URL(s) from clipboard">📋 Paste</button>
+        <button id="btn-paste-url" type="button" onclick="pasteUrlFromClipboard()" title="Paste URL(s) from clipboard" aria-label="Paste from clipboard">📋</button>
         <button class="primary" onclick="addUrl()">Extract</button>
       </div>
       <div class="hint">
@@ -6616,6 +6649,14 @@ window.__vdSniffProgress = function(sniffId, n) {
 
 const hlsTasks = new Map();
 
+// Stash for IMDB poster URLs picked from the search modal. Keyed by
+// IMDB id (e.g. "tt14475988"). Used at card-construction time so the
+// thumbnail shows the actual movie/show cover *immediately* — before
+// multi-source sniff completes and finds (or fails to find) a poster
+// in the streaming page's metadata. Persists for the page lifetime;
+// no eviction needed (max ~100 lookups per session, tiny URLs).
+const imdbThumbCache = new Map();
+
 // Per-source quality labels for the "↗ host" buttons on cards. Populated
 // by the multi-sniff finalize step once each streaming front-end has
 // returned its master playlist. setSourceButtons reads from here so the
@@ -6926,8 +6967,13 @@ function playRipAnimation(opts) {
   _ripBusy = true;
   let remaining = count;
   const done = () => { remaining--; if (remaining <= 0) _ripBusy = false; };
+  // For multi-burst calls (Rip All Pending: 3 staggered slashes) we
+  // only want the GET RIPPED! wordmark on the *first* overlay — three
+  // wordmarks stacking on top of each other looks like a render bug.
+  // Subsequent bursts just contribute fresh slash claws.
   for (let i = 0; i < count; i++) {
-    setTimeout(() => _spawnRipOverlay(done), i * stagger);
+    const showWordmark = (i === 0);
+    setTimeout(() => _spawnRipOverlay(done, { withWordmark: showWordmark }), i * stagger);
   }
 }
 
@@ -6991,7 +7037,9 @@ function playErrorAnimation() {
   document.body.appendChild(overlay);
 }
 
-function _spawnRipOverlay(onDone) {
+function _spawnRipOverlay(onDone, spawnOpts) {
+  spawnOpts = spawnOpts || {};
+  const withWordmark = spawnOpts.withWordmark !== false; // default true
   const W = 1024, H = 384;
   const SLAM_START = 0.05, SLAM_DUR = 0.40;
   const SWIPE_START = 0.50, SWIPE_DUR = 0.10;
@@ -7031,7 +7079,7 @@ function _spawnRipOverlay(onDone) {
 
   overlay.innerHTML = `
     <div class="rr-rip-viewport">
-      <img class="rr-rip-wordmark" src="/get-ripped.png" alt="GET RIPPED!" draggable="false">
+      ${withWordmark ? '<img class="rr-rip-wordmark" src="/get-ripped.png" alt="GET RIPPED!" draggable="false">' : ''}
       <div class="rr-rip-flash"></div>
       <svg class="rr-rip-claws" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
         <defs>${clipDefs}</defs>
@@ -7041,7 +7089,7 @@ function _spawnRipOverlay(onDone) {
   document.body.appendChild(overlay);
 
   const viewport = overlay.querySelector(".rr-rip-viewport");
-  const wordmark = overlay.querySelector(".rr-rip-wordmark");
+  const wordmark = overlay.querySelector(".rr-rip-wordmark"); // null on follow-on bursts
   const flash = overlay.querySelector(".rr-rip-flash");
   const svg = overlay.querySelector(".rr-rip-claws");
   const rects = Array.from(svg.querySelectorAll("[data-rect]"));
@@ -7081,7 +7129,9 @@ function _spawnRipOverlay(onDone) {
     const shakeT = (t - SWIPE_START) / 0.25;
     const sx = (shakeT > 0 && shakeT < 1) ? Math.sin(shakeT * 60) * 4 : 0;
     const sy = (shakeT > 0 && shakeT < 1) ? Math.cos(shakeT * 55) * 4 : 0;
-    wordmark.style.transform = `translate(calc(-50% + ${sx.toFixed(2)}px), calc(-50% + ${sy.toFixed(2)}px)) rotate(${(baseRot + wobble).toFixed(3)}deg) scale(${baseScale.toFixed(3)})`;
+    if (wordmark) {
+      wordmark.style.transform = `translate(calc(-50% + ${sx.toFixed(2)}px), calc(-50% + ${sy.toFixed(2)}px)) rotate(${(baseRot + wobble).toFixed(3)}deg) scale(${baseScale.toFixed(3)})`;
+    }
 
     const swipeT = (t - SWIPE_START) / SWIPE_DUR;
     if (swipeT < 0) {
@@ -7443,6 +7493,18 @@ function openImdbSearch(initialQuery) {
       `;
       row.addEventListener("click", () => {
         close();
+        // Stash the poster URL so the card we're about to spawn can
+        // show the cover art *immediately* — without waiting for the
+        // multi-source sniff to find a thumbnail in the streaming
+        // page metadata. Keyed by IMDB id so the lookup at card-
+        // construction time is unambiguous.
+        if (item.thumb && item.id) {
+          imdbThumbCache.set(item.id, item.thumb);
+        }
+        // Also cache by every URL the IMDB rewrite path will
+        // generate from this id (so if the user later types the
+        // 111movies/streamimdb URL directly we still find the
+        // poster). Cheap belt-and-suspenders.
         const inp = $("#url");
         if (inp) {
           inp.value = item.id;
@@ -7726,6 +7788,16 @@ async function addUrl() {
     // actually surfaces variants from every source.
     const cardUrl = job.urls[0];
     const card = makeCard(cardUrl);
+    // If this card came from a search-modal pick, the user has
+    // already seen the poster — render it immediately on the card
+    // (rather than waiting for sniff to find one in the streaming
+    // page metadata, which often returns a generic player thumb).
+    const pickedThumb = job.choice && job.choice.id
+                        ? imdbThumbCache.get(job.choice.id) : null;
+    if (pickedThumb) {
+      const t = card.el.querySelector(".job-thumb");
+      if (t) t.style.backgroundImage = `url("${pickedThumb}")`;
+    }
     $("#pending").prepend(card.el);
     updateStatusBar();
     refreshRipAllButton();
@@ -7790,6 +7862,12 @@ function makeCard(url) {
         <div class="ed-summary" style="display:none; margin-top:4px; font-size:11px; color:#000080;"></div>
         <div class="ed-strip"></div>
       </div>
+      <!-- Cancel/Remove lives in the top-right corner of the card so the
+           bottom action row can stay focused on positive actions (Rip,
+           Edit, Reveal). Same .remove class so existing JS handlers
+           (cancellation while running, removal when pending/done) keep
+           working — only the styling/position changed. -->
+      <button class="card-x remove danger" title="Remove / cancel" aria-label="Cancel">✕</button>
     </div>
     <div class="options">
       <select class="quality"></select>
@@ -7797,14 +7875,16 @@ function makeCard(url) {
       <label class="subs-lbl small" title="Embed subtitles + chapters into the file when available">
         <input type="checkbox" class="subs" checked> subs
       </label>
-      <button class="primary start">Rip It!</button>
+      <!-- Edit comes before Rip It! in the DOM so when both are visible
+           the user reads "Edit, then Rip It!" left-to-right (matches
+           the natural workflow of trimming a clip before exporting). -->
       <button class="edit" style="display:none;">Edit</button>
+      <button class="primary start">Rip It!</button>
       <!-- Contextual action buttons — visibility driven by CSS based on
            the card's dataset.state. Retry shows on errors, Reveal/Open
            after successful completion. -->
       <button class="btn-retry" title="Re-run this download">↻ Retry</button>
       <button class="btn-reveal" title="Reveal the saved file in Finder">Reveal</button>
-      <button class="danger remove">Cancel</button>
     </div>
     <div class="progress-wrap"><div class="bar"></div></div>
     <div class="status"></div>
