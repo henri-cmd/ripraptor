@@ -34,7 +34,7 @@ DEFAULT_DEST = str(Path.home() / "Downloads")
 # App version. Single source of truth — surfaces in status bar, About panel,
 # Settings → About, /versions endpoint, and is what the update checker
 # compares against the latest GitHub release tag.
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 
 # Bundled-binary directory inside the .app:
 #   /Applications/Rip Raptor.app/Contents/Resources/bin/{yt-dlp,ffmpeg,ffprobe}
@@ -3285,59 +3285,164 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
 
         if path == "/imdb/search":
-            # Live IMDB title search via the same suggest API the IMDB
-            # homepage uses for autocomplete:
-            #   https://v3.sg.media-imdb.com/suggestion/<first-letter>/<query>.json
-            # Returns ranked title matches with poster thumbs. We
-            # filter to actual movie/TV results — the suggest endpoint
-            # also returns name (actor) results which would just
-            # confuse the picker.
+            # Title search backed by *two* sources fanned out in parallel:
+            #   1. IMDB's typeahead suggest API
+            #        https://v3.sg.media-imdb.com/suggestion/<letter>/<query>.json
+            #      Fast, well-ranked, but it's an autocomplete endpoint —
+            #      caps at ~8 popular results. Misses anything obscure.
+            #   2. Stremio cinemeta catalog search (we already use it for
+            #      episode names):
+            #        https://v3-cinemeta.strem.io/catalog/{series,movie}/top/search=<q>.json
+            #      More comprehensive — surfaces lower-popularity titles
+            #      that IMDB suggest drops. We hit series + movie in
+            #      parallel so a single search covers both kinds.
+            #
+            # Results from all three calls are merged + deduped by tt-id;
+            # IMDB suggest's poster URLs win when both sides have the
+            # same title (suggest's images are sized for inline display).
             from urllib.parse import parse_qs
             qs = parse_qs(urlparse(self.path).query)
             query = (qs.get("q", [""])[0] or "").strip()
             if not query:
                 return self._json(400, {"error": "no query"})
-            # IMDB's suggest path expects: /<first-alnum-char>/<query-with-underscores>.json
             safe = re.sub(r"[^A-Za-z0-9]+", "_", query).strip("_").lower()
             if not safe:
                 return self._json(400, {"error": "empty query"})
             first = safe[0]
-            api_url = f"https://v3.sg.media-imdb.com/suggestion/{first}/{safe}.json"
+            from urllib.parse import quote as _urlquote
+            q_enc = _urlquote(query)
+            urls = [
+                ("imdb",   f"https://v3.sg.media-imdb.com/suggestion/{first}/{safe}.json"),
+                ("series", f"https://v3-cinemeta.strem.io/catalog/series/top/search={q_enc}.json"),
+                ("movie",  f"https://v3-cinemeta.strem.io/catalog/movie/top/search={q_enc}.json"),
+            ]
+            # Concurrent fetch — total wall time is max(of the three)
+            # rather than sum. All three are public JSON APIs that
+            # respond in <1s under normal conditions.
+            out: dict = {}
+            errors: list = []
+            def _fetch(name: str, u: str):
+                try:
+                    s, b = _simple_get(u, timeout=8.0)
+                    if s == 200:
+                        out[name] = b
+                    else:
+                        errors.append(f"{name} HTTP {s}")
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+            ts = [threading.Thread(target=_fetch, args=(n, u), daemon=True)
+                  for (n, u) in urls]
+            for t in ts: t.start()
+            for t in ts: t.join(timeout=10.0)
+
+            # Merge. dedupe by tt-id. IMDB suggest provides better
+            # poster thumbs (sized for autocomplete), so its entries
+            # win on conflict. Cinemeta fills in the long tail.
+            results: list = []
+            seen: set = set()
+
+            def _add(rec: dict):
+                tt = rec.get("id") or ""
+                if not tt.startswith("tt") or tt in seen:
+                    return
+                seen.add(tt)
+                results.append(rec)
+
+            # IMDB suggest first (better thumbs).
             try:
-                status, body = _simple_get(api_url)
-            except Exception as e:
-                return self._json(502, {"error": f"imdb fetch failed: {e}"})
-            if status != 200:
-                return self._json(502, {"error": f"imdb HTTP {status}"})
-            try:
-                data = json.loads(body)
-            except Exception:
-                return self._json(502, {"error": "imdb response not JSON"})
-            results = []
-            for e in (data.get("d") or []):
-                eid = (e.get("id") or "").strip()
-                if not eid.startswith("tt"):
-                    continue  # name results (nm…) etc. — not titles
-                qid = (e.get("qid") or "").strip()
-                if qid in ("movie", "short", "tvMovie", "video"):
-                    kind = "movie"
-                elif qid in ("tvSeries", "tvMiniSeries", "tvSpecial", "tvEpisode"):
-                    kind = "tv"
+                if "imdb" in out:
+                    data = json.loads(out["imdb"])
+                    for e in (data.get("d") or []):
+                        eid = (e.get("id") or "").strip()
+                        if not eid.startswith("tt"):
+                            continue
+                        qid = (e.get("qid") or "").strip()
+                        if qid in ("movie", "short", "tvMovie", "video"):
+                            kind = "movie"
+                        elif qid in ("tvSeries", "tvMiniSeries",
+                                     "tvSpecial", "tvEpisode"):
+                            kind = "tv"
+                        else:
+                            continue
+                        thumb = ""
+                        i = e.get("i")
+                        if isinstance(i, dict):
+                            thumb = i.get("imageUrl") or ""
+                        _add({
+                            "id":     eid,
+                            "title":  (e.get("l") or "").strip(),
+                            "year":   e.get("y"),
+                            "kind":   kind,
+                            "qLabel": (e.get("q") or "").strip(),
+                            "thumb":  thumb,
+                            "extra":  (e.get("s") or "").strip(),
+                        })
+            except Exception as ex:
+                errors.append(f"imdb parse: {ex}")
+
+            # Cinemeta — series first, then movies. Each contributes
+            # whatever IMDB suggest missed. releaseInfo is "2021" for
+            # finite runs / "2021-" for ongoing / "1992–1994" for
+            # closed ranges; first 4-digit number wins as the year.
+            for source_key, kind_label, qlabel in (
+                ("series", "tv",    "TV Series"),
+                ("movie",  "movie", "Movie"),
+            ):
+                try:
+                    if source_key not in out:
+                        continue
+                    data = json.loads(out[source_key])
+                    for m in (data.get("metas") or []):
+                        eid = (m.get("imdb_id") or m.get("id") or "").strip()
+                        if not eid.startswith("tt"):
+                            continue
+                        ri = (m.get("releaseInfo") or "").strip()
+                        ym = re.search(r"\d{4}", ri)
+                        try:
+                            year = int(ym.group(0)) if ym else None
+                        except ValueError:
+                            year = None
+                        _add({
+                            "id":     eid,
+                            "title":  (m.get("name") or "").strip(),
+                            "year":   year,
+                            "kind":   kind_label,
+                            "qLabel": qlabel,
+                            "thumb":  (m.get("poster") or "").strip(),
+                            "extra":  ri,
+                        })
+                except Exception as ex:
+                    errors.append(f"{source_key} parse: {ex}")
+
+            if not results:
+                # Surface a real error message rather than an empty list
+                # — empty + 200 looks like "no matches" to the UI when
+                # actually all three upstreams may have failed.
+                if errors:
+                    return self._json(502, {"error": " · ".join(errors[:3])})
+                return self._json(200, {"query": query, "results": []})
+
+            # Re-rank: exact title match first, then title-starts-with,
+            # then anything else. Within each tier, newer first. Keeps
+            # niche-but-perfect matches ("The Line" 2021) from being
+            # buried under fuzzy IMDB-suggest results when the user's
+            # query exactly names the title they want.
+            ql = query.strip().lower()
+            def _rank(r):
+                tl = (r.get("title") or "").strip().lower()
+                if tl == ql:
+                    tier = 0
+                elif tl.startswith(ql):
+                    tier = 1
+                elif ql in tl:
+                    tier = 2
                 else:
-                    continue  # unknown qid (podcast, music video, etc.)
-                thumb = ""
-                i = e.get("i")
-                if isinstance(i, dict):
-                    thumb = i.get("imageUrl") or ""
-                results.append({
-                    "id":     eid,
-                    "title":  (e.get("l") or "").strip(),
-                    "year":   e.get("y"),
-                    "kind":   kind,
-                    "qLabel": (e.get("q") or "").strip(),
-                    "thumb":  thumb,
-                    "extra":  (e.get("s") or "").strip(),
-                })
+                    tier = 3
+                # Negative year so DESC sort comes naturally.
+                year = r.get("year") if isinstance(r.get("year"), int) else 0
+                return (tier, -year)
+            results.sort(key=_rank)
+
             return self._json(200, {"query": query, "results": results})
 
         if path == "/imdb/episodes":
